@@ -1,8 +1,9 @@
 """Gateway runtime-metadata footer.
 
 Renders a compact footer showing runtime state (model, context %, cwd) and
-appends it to the FINAL message of an agent turn when enabled.  Off by default
-to keep replies minimal.
+appends it to the FINAL message of an agent turn when enabled. Off by default
+to keep replies minimal. A context-pressure notice can still appear while the
+footer is off.
 
 Config (``~/.hermes/config.yaml``)::
 
@@ -39,6 +40,20 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_CONTEXT_RESET_NOTICE = (
+    "⚠️ This conversation has a lot of context and may feel slow. "
+    "Send /reset to start fresh."
+)
+
+
+def context_needs_reset_notice(
+    context_tokens: int, context_length: Optional[int]
+) -> bool:
+    return context_tokens >= 100_000 or bool(
+        context_length
+        and context_length > 0
+        and context_tokens / context_length >= 0.75
+    )
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -157,25 +172,31 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    include_context_notice: bool = True,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
-    Returns the footer text (empty string when disabled or no data).  Callers
-    append this to the final response themselves, preserving a single blank
-    line of separation.
+    Returns footer text, a context-pressure notice, or both. Callers append it
+    to the final response themselves, preserving a single blank line of
+    separation.
 
     ``turn_seconds`` is the wall-clock duration of the agent run, measured by
     the caller with ``time.monotonic()``.  Callers that don't measure it leave
     it ``None`` and the ``latency`` field is skipped.
     """
     cfg = resolve_footer_config(user_config, platform_key)
-    if not cfg.get("enabled"):
-        return ""
-    return format_runtime_footer(
-        model=model,
-        context_tokens=context_tokens,
-        context_length=context_length,
-        cwd=cwd,
-        turn_seconds=turn_seconds,
-        fields=cfg.get("fields") or _DEFAULT_FIELDS,
-    )
+    footer = ""
+    if cfg.get("enabled"):
+        footer = format_runtime_footer(
+            model=model,
+            context_tokens=context_tokens,
+            context_length=context_length,
+            cwd=cwd,
+            turn_seconds=turn_seconds,
+            fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        )
+    if include_context_notice and context_needs_reset_notice(
+        context_tokens, context_length
+    ):
+        return f"{footer}\n{_CONTEXT_RESET_NOTICE}" if footer else _CONTEXT_RESET_NOTICE
+    return footer

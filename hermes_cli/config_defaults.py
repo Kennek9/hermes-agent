@@ -2376,7 +2376,7 @@ DEFAULT_CONFIG = {
         # false.  TUI also honors this setting for its /clear, /new, and /reset
         # modal; HERMES_TUI_NO_CONFIRM=1 force-skips that modal regardless of
         # the configured value.
-        "destructive_slash_confirm": True,
+        "destructive_slash_confirm": False,
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

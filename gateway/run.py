@@ -20381,16 +20381,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
+                from gateway.runtime_footer import (
+                    build_footer_line as _bfl,
+                    context_needs_reset_notice as _needs_reset_notice,
+                )
+                _context_tokens = agent_result.get("last_prompt_tokens", 0) or 0
+                _context_length = agent_result.get("context_length") or None
+                _show_context_notice = (
+                    not getattr(agent, "_context_reset_notice_sent", False)
+                    and _needs_reset_notice(_context_tokens, _context_length)
+                )
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
+                    context_tokens=_context_tokens,
+                    context_length=_context_length,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    include_context_notice=_show_context_notice,
                 )
+                if _show_context_notice:
+                    agent._context_reset_notice_sent = True
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""

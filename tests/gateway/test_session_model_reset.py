@@ -92,7 +92,7 @@ async def test_new_command_only_clears_own_session():
     runner._pending_model_notes[session_key] = "[Note: switched to gpt-4o.]"
     runner._pending_model_notes[other_key] = "[Note: switched to claude-sonnet-4-6.]"
 
-    await runner._handle_reset_command(_make_event("/new"))
+    result = await runner._handle_reset_command(_make_event("/new"))
 
     assert session_key not in runner._session_model_overrides
     assert other_key in runner._session_model_overrides
@@ -100,3 +100,4 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+    assert str(result) == "session reset, starting fresh"

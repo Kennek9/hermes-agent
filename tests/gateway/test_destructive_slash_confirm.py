@@ -1,6 +1,6 @@
 """Tests for the gateway's destructive-slash-confirm wrapper.
 
-When ``approvals.destructive_slash_confirm`` is True (default), /new,
+When ``approvals.destructive_slash_confirm`` is True, /new,
 /reset, and /undo route through the slash-confirm primitive — native
 yes/no buttons on Telegram/Discord/Slack, text fallback elsewhere.
 When False (after "Always Approve"), the destructive action runs

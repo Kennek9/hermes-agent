@@ -133,6 +133,47 @@ def test_build_footer_per_platform_off_suppresses():
     assert out == ""
 
 
+def test_build_footer_warns_when_context_is_large_even_when_footer_is_off():
+    out = build_footer_line(
+        user_config={},
+        platform_key="feishu",
+        model="openai/gpt-5.6-terra",
+        context_tokens=100_000,
+        context_length=1_100_000,
+        cwd="/tmp",
+    )
+
+    assert out
+    assert "/reset" in out
+
+
+def test_build_footer_warns_when_context_nears_a_smaller_window():
+    out = build_footer_line(
+        user_config={},
+        platform_key="feishu",
+        model="openai/gpt-5.6-terra",
+        context_tokens=75_000,
+        context_length=100_000,
+        cwd="/tmp",
+    )
+
+    assert out
+    assert "/reset" in out
+
+
+def test_build_footer_can_suppress_a_repeated_context_warning():
+    out = build_footer_line(
+        user_config={},
+        platform_key="feishu",
+        model="openai/gpt-5.6-terra",
+        context_tokens=100_000,
+        context_length=1_100_000,
+        include_context_notice=False,
+    )
+
+    assert out == ""
+
+
 
 # ---------------------------------------------------------------------------
 # latency — opt-in wall-clock turn duration
