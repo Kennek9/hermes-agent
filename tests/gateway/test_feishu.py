@@ -444,6 +444,9 @@ class TestAdapterBehavior(unittest.TestCase):
                 "bot_deleted",
                 "p2p_chat_entered",
                 "message_recalled",
+                "customized:im.chat.member.user.added_v1",
+                "customized:im.chat.member.user.deleted_v1",
+                "customized:im.chat.member.user.withdrawn_v1",
                 "customized:drive.notice.comment_add_v1",
                 "customized:vc.bot.meeting_invited_v1",
                 "build",
@@ -472,10 +475,8 @@ class TestAdapterBehavior(unittest.TestCase):
             run_threadsafe.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_user_reaction_with_managed_emoji_is_still_routed(self):
-        # Operator-origin filter is enough to prevent feedback loops; we must
-        # not additionally swallow user-origin reactions just because their
-        # emoji happens to collide with a lifecycle emoji.
+    def test_user_reaction_does_not_start_a_conversation(self):
+        # Reactions are feedback, not new prompts for the agent.
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -489,16 +490,11 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         data = SimpleNamespace(event=event)
 
-        def _close_coro_and_return_future(coro, _loop):
-            coro.close()
-            return SimpleNamespace(add_done_callback=lambda _: None)
-
         with patch(
-            "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe",
-            side_effect=_close_coro_and_return_future,
+            "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe"
         ) as run_threadsafe:
             adapter._on_reaction_event("im.message.reaction.created_v1", data)
-        run_threadsafe.assert_called_once()
+        run_threadsafe.assert_not_called()
 
     def _build_reaction_adapter(self, *, msg_sender_id: str):
         """Build a FeishuAdapter wired up to return a single GET-message result."""

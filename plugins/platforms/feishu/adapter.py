@@ -63,7 +63,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence
@@ -1697,11 +1697,15 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
+        builder = EventDispatcherHandler.builder(
+            self._encrypt_key,
+            self._verification_token,
+        )
+        register_p1 = getattr(builder, "register_p1_customized_event", None)
+        if register_p1 is not None:
+            builder = register_p1("message", self._on_legacy_message_event)
         return (
-            EventDispatcherHandler.builder(
-                self._encrypt_key,
-                self._verification_token,
-            )
+            builder
             .register_p2_im_message_message_read_v1(self._on_message_read_event)
             .register_p2_im_message_receive_v1(self._on_message_event)
             .register_p2_im_message_reaction_created_v1(
@@ -1715,6 +1719,18 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
             .register_p2_im_message_recalled_v1(self._on_message_recalled)
+            .register_p2_customized_event(
+                "im.chat.member.user.added_v1",
+                lambda data: self._on_member_changed("member_added", data),
+            )
+            .register_p2_customized_event(
+                "im.chat.member.user.deleted_v1",
+                lambda data: self._on_member_changed("member_removed", data),
+            )
+            .register_p2_customized_event(
+                "im.chat.member.user.withdrawn_v1",
+                lambda data: self._on_member_changed("member_withdrawn", data),
+            )
             .register_p2_customized_event(
                 "drive.notice.comment_add_v1",
                 self._on_drive_comment_event,
@@ -2486,6 +2502,38 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         self._submit_on_loop(loop, self._handle_message_event_data(data))
 
+    def _on_legacy_message_event(self, data: Any) -> None:
+        """Route legacy Channel ``message`` events through the normal handler."""
+        event = getattr(data, "event", None)
+        if not isinstance(event, dict):
+            logger.debug("[Feishu] Dropping malformed legacy message event")
+            return
+
+        mentions = [{
+            "key": "@_user_1",
+            "id": {"open_id": self._bot_open_id, "user_id": self._bot_user_id},
+            "name": self._bot_name,
+        }] if event.get("is_mention") else []
+        text = str(event.get("text_without_at_bot") or event.get("text") or "")
+        envelope = {"event": {
+            "message": {
+                "message_id": str(event.get("open_message_id") or event.get("message_id") or ""),
+                "chat_id": str(event.get("open_chat_id") or event.get("chat_id") or ""),
+                "chat_type": "p2p" if event.get("chat_type") == "private" else "group",
+                "message_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+                "mentions": mentions,
+                "root_id": event.get("root_id"),
+                "parent_id": event.get("parent_id"),
+            },
+            "sender": {"sender_type": "user", "sender_id": {
+                "open_id": str(event.get("open_id") or ""),
+                "user_id": str(event.get("user_id") or event.get("employee_id") or ""),
+                "union_id": str(event.get("union_id") or ""),
+            }},
+        }}
+        self._on_message_event(self._namespace_from_mapping(envelope))
+
     def _enqueue_pending_inbound_event(self, data: Any) -> bool:
         """Append an event to the pending-inbound queue.
 
@@ -2614,6 +2662,11 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
 
+        try:
+            await self._emit_chat_evidence_message(message, sender)
+        except Exception:
+            logger.debug("[Feishu] chat-evidence normalization failed", exc_info=True)
+
         reason = self._admit(sender, message)
         if reason is not None:
             logger.debug("[Feishu] dropping inbound event: %s", reason)
@@ -2656,6 +2709,144 @@ class FeishuAdapter(BasePlatformAdapter):
     def _on_message_recalled(self, data: Any) -> None:
         logger.debug("[Feishu] Message recalled by user")
 
+    def _on_member_changed(self, event_type: str, data: Any) -> None:
+        """Forward group membership changes to the knowledge permission store."""
+        if not self._platform_events_subscribed():
+            return
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            return
+        event = getattr(data, "event", None) or data
+        chat_id = str(getattr(event, "chat_id", "") or "")
+        members = getattr(event, "users", None) or ()
+        event_at = self._chat_evidence_timestamp(getattr(event, "event_time", None))
+        event_at = event_at or datetime.now(timezone.utc)
+        for member in members:
+            identity = getattr(member, "user_id", None)
+            actor_id = getattr(identity, "user_id", None) or getattr(
+                identity, "open_id", None
+            )
+            if not chat_id or not actor_id:
+                continue
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_type="group",
+                user_id=str(actor_id),
+                message_id=None,
+            )
+            normalized = {
+                "platform": "feishu",
+                "event_type": event_type,
+                "payload": {
+                    "chat_id": chat_id[:128],
+                    "actor_id": str(actor_id)[:128],
+                    "event_at": event_at.isoformat(),
+                },
+            }
+            self._submit_on_loop(
+                loop,
+                self._fire_platform_event(normalized, source),
+            )
+
+    @staticmethod
+    def _platform_events_subscribed() -> bool:
+        """Return whether a plugin consumes normalized platform events."""
+        try:
+            from hermes_cli.lifecycle import has_hook
+
+            return has_hook("gateway_platform_event")
+        except Exception:
+            return False
+
+    async def _fire_platform_event(self, event: Dict[str, Any], source: Any) -> None:
+        """Forward one normalized event to the gateway hook boundary."""
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None:
+            return
+        try:
+            await handler(event, source)
+        except Exception:
+            logger.debug("[Feishu] gateway_platform_event dispatch failed", exc_info=True)
+
+    @staticmethod
+    def _chat_evidence_timestamp(value: Any) -> datetime | None:
+        """Convert a Feishu millisecond timestamp to UTC."""
+        if value is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(value) / 1000.0, timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    async def _emit_chat_evidence_message(self, message: Any, sender: Any) -> None:
+        """Emit group messages and direct Lark document shares without downloading media."""
+        if (
+            getattr(self, "_platform_event_handler", None) is None
+            or not self._platform_events_subscribed()
+        ):
+            return
+        chat_type = str(getattr(message, "chat_type", "p2p") or "p2p").lower()
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        sender_ref = getattr(sender, "sender_id", None)
+        sender_id = getattr(sender_ref, "user_id", None) or getattr(
+            sender_ref, "open_id", None
+        )
+        if not chat_id or not message_id or not sender_id:
+            return
+        normalized_message = normalize_feishu_message(
+            message_type=getattr(message, "message_type", "") or "",
+            raw_content=getattr(message, "content", "") or "",
+            mentions=getattr(message, "mentions", None),
+            bot=self._bot_identity(),
+        )
+        normalized_text = normalized_message.text_content
+        direct_document = chat_type in {"p2p", "private"} and (
+            any(host in normalized_text.lower() for host in ("feishu.cn/", "larksuite.com/"))
+            and any(path in normalized_text.lower() for path in ("/docx/", "/docs/", "/wiki/"))
+        )
+        if chat_type != "group" and not direct_document:
+            return
+        event_at = self._chat_evidence_timestamp(
+            getattr(message, "update_time", None)
+            or getattr(message, "create_time", None)
+        ) or datetime.now(timezone.utc)
+        sent_at = self._chat_evidence_timestamp(getattr(message, "create_time", None))
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=str(sender_id),
+            message_id=message_id,
+        )
+        if direct_document:
+            await self._fire_platform_event(
+                {
+                    "platform": "feishu",
+                    "event_type": "member_added",
+                    "payload": {
+                        "chat_id": chat_id[:128],
+                        "actor_id": str(sender_id)[:128],
+                        "event_at": event_at.isoformat(),
+                    },
+                },
+                source,
+            )
+        await self._fire_platform_event(
+            {
+                "platform": "feishu",
+                "event_type": "message_received",
+                "payload": {
+                    "chat_id": chat_id[:128],
+                    "message_id": message_id[:128],
+                    "sender_id": str(sender_id)[:128],
+                    "sent_at": (sent_at or event_at).isoformat(),
+                    "event_at": event_at.isoformat(),
+                    "text": normalized_text[:8192],
+                },
+            },
+            source,
+        )
+
     def _on_drive_comment_event(self, data: Any) -> None:
         """Handle drive document comment notification (drive.notice.comment_add_v1).
 
@@ -2685,7 +2876,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._submit_on_loop(loop, handle_meeting_invited_event(self, data))
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
-        """Route user reactions on bot messages as synthetic text events."""
+        """Observe reactions without starting an agent conversation."""
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         operator_type = str(getattr(event, "operator_type", "") or "")
@@ -2699,18 +2890,6 @@ class FeishuAdapter(BasePlatformAdapter):
             operator_type,
             emoji_type,
         )
-        # Drop bot/app-origin reactions to break the feedback loop from our
-        # own lifecycle reactions. A human reacting with the same emoji (e.g.
-        # clicking Typing on a bot message) is still routed through.
-        loop = self._loop
-        if (
-            operator_type in {"bot", "app"}
-            or not message_id
-            or loop is None
-            or bool(getattr(loop, "is_closed", lambda: False)())
-        ):
-            return
-        self._submit_on_loop(loop, self._handle_reaction_event(event_type, data))
 
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Handle card-action callback from the Feishu SDK (synchronous).
@@ -3657,6 +3836,12 @@ class FeishuAdapter(BasePlatformAdapter):
             self._on_drive_comment_event(data)
         elif event_type == "vc.bot.meeting_invited_v1":
             self._on_meeting_invited_event(data)
+        elif event_type == "im.chat.member.user.added_v1":
+            self._on_member_changed("member_added", data)
+        elif event_type == "im.chat.member.user.deleted_v1":
+            self._on_member_changed("member_removed", data)
+        elif event_type == "im.chat.member.user.withdrawn_v1":
+            self._on_member_changed("member_withdrawn", data)
         else:
             logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
         return web.json_response({"code": 0, "msg": "ok"})
