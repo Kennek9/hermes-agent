@@ -1245,10 +1245,10 @@ def _build_mentions_map(
         key = str(getattr(mention, "key", "") or "")
         if not key:
             continue
-        if key == "@_all":
+        open_id, user_id = _extract_mention_ids(mention)
+        if key == "@_all" or "all" in (open_id, user_id):
             result[key] = FeishuMentionRef(is_all=True)
             continue
-        open_id, user_id = _extract_mention_ids(mention)
         name = str(getattr(mention, "name", "") or "").strip()
         result[key] = FeishuMentionRef(
             name=name,
@@ -1738,6 +1738,10 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_customized_event(
                 "vc.bot.meeting_invited_v1",
                 self._on_meeting_invited_event,
+            )
+            .register_p2_customized_event(
+                "vc.meeting.all_meeting_ended_v1",
+                self._on_company_meeting_ended,
             )
             .build()
         )
@@ -2509,12 +2513,29 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Dropping malformed legacy message event")
             return
 
+        # The legacy flag includes broadcasts. Only the provider's removal of
+        # a bot-specific mention proves this message was directed at this bot.
+        original_text = str(event.get("text") or "")
+        without_bot = event.get("text_without_at_bot")
+        directly_mentioned = (
+            event.get("is_mention") is True
+            and bool(original_text)
+            and (
+                (isinstance(without_bot, str) and original_text.strip() != without_bot.strip())
+                # Legacy events omit the stripped field for a bare @bot.
+                or (
+                    without_bot is None
+                    and bool(self._bot_name)
+                    and original_text.strip() == "@" + self._bot_name
+                )
+            )
+        )
         mentions = [{
             "key": "@_user_1",
             "id": {"open_id": self._bot_open_id, "user_id": self._bot_user_id},
             "name": self._bot_name,
-        }] if event.get("is_mention") else []
-        text = str(event.get("text_without_at_bot") or event.get("text") or "")
+        }] if directly_mentioned else []
+        text = without_bot if isinstance(without_bot, str) else original_text
         envelope = {"event": {
             "message": {
                 "message_id": str(event.get("open_message_id") or event.get("message_id") or ""),
@@ -2770,82 +2791,37 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _chat_evidence_timestamp(value: Any) -> datetime | None:
-        """Convert a Feishu millisecond timestamp to UTC."""
-        if value is None:
-            return None
-        try:
-            return datetime.fromtimestamp(float(value) / 1000.0, timezone.utc)
-        except (TypeError, ValueError, OverflowError, OSError):
-            return None
+        """Shared timestamp conversion for message and membership events."""
+        from plugins.platforms.feishu.chat_evidence import evidence_timestamp
+
+        return evidence_timestamp(value)
 
     async def _emit_chat_evidence_message(self, message: Any, sender: Any) -> None:
-        """Emit group messages and direct Lark document shares without downloading media."""
+        """Observe before reply admission; storage never fetches message resources."""
+        from plugins.platforms.feishu.chat_evidence import build_chat_evidence
+
         if (
             getattr(self, "_platform_event_handler", None) is None
             or not self._platform_events_subscribed()
         ):
             return
-        chat_type = str(getattr(message, "chat_type", "p2p") or "p2p").lower()
-        chat_id = str(getattr(message, "chat_id", "") or "")
-        message_id = str(getattr(message, "message_id", "") or "")
-        sender_ref = getattr(sender, "sender_id", None)
-        sender_id = getattr(sender_ref, "user_id", None) or getattr(
-            sender_ref, "open_id", None
-        )
-        if not chat_id or not message_id or not sender_id:
-            return
-        normalized_message = normalize_feishu_message(
+        normalized = normalize_feishu_message(
             message_type=getattr(message, "message_type", "") or "",
             raw_content=getattr(message, "content", "") or "",
             mentions=getattr(message, "mentions", None),
             bot=self._bot_identity(),
         )
-        normalized_text = normalized_message.text_content
-        direct_document = chat_type in {"p2p", "private"} and (
-            any(host in normalized_text.lower() for host in ("feishu.cn/", "larksuite.com/"))
-            and any(path in normalized_text.lower() for path in ("/docx/", "/docs/", "/wiki/"))
-        )
-        if chat_type != "group" and not direct_document:
+        evidence = build_chat_evidence(message, sender, normalized.text_content)
+        if evidence is None:
             return
-        event_at = self._chat_evidence_timestamp(
-            getattr(message, "update_time", None)
-            or getattr(message, "create_time", None)
-        ) or datetime.now(timezone.utc)
-        sent_at = self._chat_evidence_timestamp(getattr(message, "create_time", None))
         source = self.build_source(
-            chat_id=chat_id,
-            chat_type=chat_type,
-            user_id=str(sender_id),
-            message_id=message_id,
+            chat_id=evidence.chat_id,
+            chat_type=evidence.chat_type,
+            user_id=evidence.sender_id,
+            message_id=evidence.message_id,
         )
-        if direct_document:
-            await self._fire_platform_event(
-                {
-                    "platform": "feishu",
-                    "event_type": "member_added",
-                    "payload": {
-                        "chat_id": chat_id[:128],
-                        "actor_id": str(sender_id)[:128],
-                        "event_at": event_at.isoformat(),
-                    },
-                },
-                source,
-            )
-        await self._fire_platform_event(
-            {
-                "platform": "feishu",
-                "event_type": "message_received",
-                "payload": {
-                    "chat_id": chat_id[:128],
-                    "message_id": message_id[:128],
-                    "sender_id": str(sender_id)[:128],
-                    "sent_at": (sent_at or event_at).isoformat(),
-                    "event_at": event_at.isoformat(),
-                    "text": normalized_text[:8192],
-                },
-            },
-            source,
-        )
+        for event in evidence.events:
+            await self._fire_platform_event(event, source)
 
     def _on_drive_comment_event(self, data: Any) -> None:
         """Handle drive document comment notification (drive.notice.comment_add_v1).
@@ -2874,6 +2850,20 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Dropping meeting invite event before adapter loop is ready")
             return
         self._submit_on_loop(loop, handle_meeting_invited_event(self, data))
+
+    def _on_company_meeting_ended(self, data: Any) -> None:
+        """Persist SDK-authenticated enterprise events without starting an agent turn."""
+        import lark_oapi as lark
+        from hermes_cli.lifecycle import invoke_hook
+
+        results = invoke_hook(
+            "gateway_platform_event",
+            platform="feishu",
+            event_type="company_meeting_ended",
+            payload={"raw_event": lark.JSON.marshal(data)},
+        )
+        if "tada_company_meeting_enqueued" not in results:
+            raise RuntimeError("Corporate meeting event was not queued")
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
         """Observe reactions without starting an agent conversation."""
@@ -4631,10 +4621,9 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
+        # Broadcast mentions remain part of the stored content, but never
+        # grant admission. A separate direct mention can still admit the message.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
@@ -4647,26 +4636,16 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._post_mentions_bot(normalized.mentions)
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
-        # IDs trump names: when both sides have open_id (or both user_id),
-        # match requires equal IDs. Name fallback only when either side
-        # lacks an ID.
+        # Use the same ID precedence as rich-text normalization; keeping two
+        # matchers here previously let the admission and rendering paths drift.
+        bot = self._bot_identity()
         for mention in mentions:
-            mention_id = getattr(mention, "id", None)
-            mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
-            mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
-            mention_name = (getattr(mention, "name", None) or "").strip()
-
-            if mention_open_id and self._bot_open_id:
-                if mention_open_id == self._bot_open_id:
-                    return True
-                continue  # IDs differ — not the bot; skip name fallback.
-            if mention_user_id and self._bot_user_id:
-                if mention_user_id == self._bot_user_id:
-                    return True
+            open_id, user_id = _extract_mention_ids(mention)
+            if getattr(mention, "key", "") == "@_all" or "all" in (open_id, user_id):
                 continue
-            if self._bot_name and mention_name == self._bot_name:
+            name = str(getattr(mention, "name", "") or "").strip()
+            if bot.matches(open_id=open_id.strip(), user_id=user_id.strip(), name=name):
                 return True
-
         return False
 
     def _post_mentions_bot(self, mentions: List[FeishuMentionRef]) -> bool:
