@@ -5,21 +5,74 @@ protocol negotiation and initial tool discovery. Split from tools/mcp_tool.py.""
 import logging
 import asyncio
 import os
+import secrets
+import threading
 import urllib.parse
 import urllib.request
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
-from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
+from tools.mcp_tool_lifecycle import _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
 from tools.mcp_tool_common import _core
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_lifecycle as _lifecycle
 from tools import mcp_tool_registration as _registration
 
 logger = logging.getLogger("tools.mcp_tool")
+
+# Native connections use the MCP loop, while caller-owned clients may use other
+# loops and threads. An asyncio.Lock cannot protect their shared PID snapshot.
+_stdio_spawn_lock = threading.Lock()
+_STDIO_SPAWN_TOKEN_ENV = "HERMES_MCP_SPAWN_TOKEN"
+
+
+@asynccontextmanager
+async def _stdio_spawn_window():
+    """Serialize only spawn and PID binding, without blocking an event loop."""
+    while not _stdio_spawn_lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    try:
+        yield
+    finally:
+        _stdio_spawn_lock.release()
+
+
+def _stdio_spawn_roots(pids: Set[int], spawn_token: str) -> Set[int]:
+    """Bind only children carrying this spawn's private environment marker."""
+    import psutil
+
+    supervisor_pid = getattr(_core._death_supervisor, "pid", None)
+    roots = pids - {supervisor_pid}
+    kept = set()
+    for pid in roots:
+        try:
+            child = psutil.Process(pid)
+            created_at = child.create_time()
+            if child.ppid() != os.getpid() or child.environ().get(_STDIO_SPAWN_TOKEN_ENV) != spawn_token:
+                continue
+            # Do not bind a recycled PID if the root exited during inspection.
+            if psutil.Process(pid).create_time() != created_at:
+                continue
+        except (psutil.Error, OSError):
+            # A snapshot delta alone cannot authorize signals to this process.
+            continue
+        if os.name != "posix":
+            kept.add(pid)
+            continue
+        try:
+            # stdio_client uses start_new_session=True. A sibling in our own
+            # group must never become a target of the orphan group's killpg.
+            if os.getpgid(pid) == pid:
+                kept.add(pid)
+        except OSError:
+            # The SDK root may have exited while descendants retain its group.
+            if _pgroup_alive(pid):
+                kept.add(pid)
+    return kept
+
 
 _PROBE_INITIALIZE_BODY = (  # JSON-RPC ``initialize`` body for the content-type preflight POST
     '{"jsonrpc":"2.0","id":"_probe","method":"initialize","params":{"protocolVersion":"2025-03-26",'
@@ -323,6 +376,11 @@ class MCPServerTransportMixin:
         safe_env = _config._build_safe_env(
             config.get("env"), inherit_secret_sources=not self._isolated)
         command, safe_env = _config._resolve_stdio_command(command, safe_env)
+        # A process-wide snapshot can include terminal/CUA children even while
+        # other MCP spawns are serialized. Give our SDK child positive identity
+        # without putting a marker in argv or depending on a provider's name.
+        spawn_token = secrets.token_hex(16)
+        safe_env[_STDIO_SPAWN_TOKEN_ENV] = spawn_token
         # OSV malware preflight, then the cached-npx swap (ordering enforced there).
         command, args = await _core._preflight_stdio_command(self.name, command, config.get("args", []))
         # A stdio child inherits this process's cwd when none is configured. Hosted sessions (ACP,
@@ -339,14 +397,6 @@ class MCPServerTransportMixin:
         # Reap orphans of prior attempts first (else retries pile up zombie pairs); unscoped on purpose;
         # off-loop because the reaper blocks up to 2s.
         await asyncio.to_thread(_lifecycle._kill_orphaned_mcp_children)
-        pids_before = _lifecycle._snapshot_child_pids()  # so the new child can be identified after spawn
-        # Reap any orphaned subprocesses from prior failed connection attempts before spawning a new one.
-        # Without this, each retry in the run() reconnect loop spawns a fresh process pair while the
-        # previous failed pair lingers — leading to rapid zombie accumulation (see #57355, #57228). The
-        # unscoped sweep also opportunistically reaps orphans left by *other* servers that never reconnect;
-        # per-server filtering via ``server_name`` remains available for scoped call sites. Run in a worker
-        # thread: the reaper blocks up to 2s (SIGTERM → wait → SIGKILL) when orphans exist, which would
-        # otherwise stall the shared MCP event loop.
         new_pids: set = set()
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
         owned_stderr = None
@@ -358,13 +408,18 @@ class MCPServerTransportMixin:
             _config._write_stderr_log_header(self.name)
             errlog = _config._get_mcp_stderr_log()
         try:
-            async with _core.stdio_client(server_params, errlog=errlog) as (read_stream, write_stream):
-                # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
-                # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
-                new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
-                if new_pids:
-                    self._track_spawned_children(new_pids)
-                self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
+            async with AsyncExitStack() as transport_stack:
+                async with _stdio_spawn_window():
+                    pids_before = _lifecycle._snapshot_child_pids()
+                    read_stream, write_stream = await transport_stack.enter_async_context(
+                        _core.stdio_client(server_params, errlog=errlog))
+                    new_pids = _stdio_spawn_roots(
+                        _lifecycle._snapshot_child_pids() - pids_before, spawn_token)
+                    if new_pids:
+                        self._track_spawned_children(new_pids)
+                    self._stdio_child_pids = set(new_pids)
+                # Handshake and the session lifetime must not hold the spawn lock:
+                # one slow server cannot prevent other stdio servers connecting.
                 async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
                     # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
                     # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
@@ -465,7 +520,15 @@ class MCPServerTransportMixin:
         if self._auth_type != "oauth":
             return None
         try:
-            from tools.mcp_oauth_manager import get_manager
+            from tools.mcp_oauth_manager import MCPOAuthManager, get_manager
+            if self._isolated:
+                if self._oauth_home is None:
+                    raise ValueError("Isolated MCP OAuth requires an explicit oauth_home")
+                if self._oauth_manager is None:
+                    self._oauth_manager = MCPOAuthManager(
+                        diagnostic_logger=self._logger, allow_tool_call_replay=False)
+                return self._oauth_manager.get_or_build_provider(
+                    self.name, url, config.get("oauth"), hermes_home=self._oauth_home)
             return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
         except Exception as exc:
             self._logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)

@@ -7,6 +7,8 @@ deliberately do not substitute ClientSession, a transport, or native MCP tasks.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import socket
@@ -16,6 +18,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import psutil
 import pytest
@@ -149,10 +152,26 @@ def _pids(path: Path) -> list[int]:
 
 
 class _HTTPFixture:
-    def __init__(self, *, redirect: str | None = None, drop_call: bool = False):
+    def __init__(self, *, redirect: str | None = None, drop_call: bool = False,
+                 registration_secret: str | None = None, oauth_challenge: str | None = None,
+                 oauth_challenge_status: int = 401):
         self.requests: list[dict] = []
+        self.all_requests: list[dict] = []
         self.redirect = redirect
         self.drop_call = drop_call
+        self.registration_secret = registration_secret
+        self.registration_requests: list[dict] = []
+        self.registration_requested = threading.Event()
+        self.release_registration = threading.Event()
+        self.oauth_challenge = oauth_challenge
+        self.oauth_challenge_status = oauth_challenge_status
+        self.oauth_flow = None
+        self.authorization_requests: list[dict] = []
+        self.callback_requests: list[dict] = []
+        self.token_requests: list[dict] = []
+        self.oauth_errors: list[str] = []
+        self.side_effects: list[dict] = []
+        self.challenges: list[dict] = []
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -175,18 +194,108 @@ class _HTTPFixture:
                 self.close_connection = True
 
             def do_GET(self):
+                owner.all_requests.append({"method": "GET", "path": self.path})
+                if owner.oauth_challenge is not None:
+                    origin = owner.url.removesuffix("/mcp")
+                    parsed = urlsplit(self.path)
+                    query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+                    if parsed.path == "/authorize":
+                        owner.authorization_requests.append(query)
+                        if (query.get("response_type") != "code" or query.get("code_challenge_method") != "S256"
+                                or not query.get("state") or not query.get("code_challenge")
+                                or query.get("redirect_uri") != f"{origin}/callback"):
+                            owner.oauth_errors.append("invalid authorization request")
+                            self.reply(400)
+                            return
+                        callback_query = urlencode({"code": "local-authorization-code", "state": query["state"],
+                                                    "iss": origin})
+                        self.reply(302, **{"Location": f'{query["redirect_uri"]}?{callback_query}'})
+                        return
+                    if parsed.path == "/callback":
+                        owner.callback_requests.append(query)
+                        try:
+                            owner.oauth_flow.deliver_callback(
+                                code=query.get("code"), state=query.get("state"), error=query.get("error"),
+                                iss=query.get("iss"))
+                        except ValueError as exc:
+                            owner.oauth_errors.append(str(exc))
+                            self.reply(400)
+                            return
+                        self.reply(200, {"callback": "delivered"})
+                        return
+                if owner.registration_secret is not None or owner.oauth_challenge is not None:
+                    origin = owner.url.removesuffix("/mcp")
+                    if "oauth-protected-resource" in self.path:
+                        self.reply(200, {"resource": owner.url, "authorization_servers": [origin]})
+                        return
+                    if "oauth-authorization-server" in self.path or "openid-configuration" in self.path:
+                        self.reply(200, {
+                            "issuer": origin, "authorization_endpoint": f"{origin}/authorize",
+                            "token_endpoint": f"{origin}/token", "registration_endpoint": f"{origin}/register",
+                            "response_types_supported": ["code"], "code_challenge_methods_supported": ["S256"],
+                        })
+                        return
                 self.reply(405)
 
             def do_DELETE(self):
+                owner.all_requests.append({"method": "DELETE", "path": self.path})
                 self.reply(204)
 
             def do_POST(self):
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                request_record = {"method": "POST", "path": self.path}
+                owner.all_requests.append(request_record)
+                raw_body = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path == "/token" and owner.oauth_challenge is not None:
+                    form = {key: values[0] for key, values in parse_qs(raw_body.decode()).items()}
+                    owner.token_requests.append(form)
+                    if form.get("grant_type") == "authorization_code":
+                        expected = owner.authorization_requests[-1] if owner.authorization_requests else {}
+                        verifier = form.get("code_verifier", "")
+                        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+                        valid = (form.get("code") == "local-authorization-code"
+                                 and form.get("redirect_uri") == expected.get("redirect_uri")
+                                 and challenge == expected.get("code_challenge"))
+                    else:
+                        valid = (form.get("grant_type") == "refresh_token"
+                                 and form.get("refresh_token") == "refresh-token")
+                    if not valid or form.get("client_id") != "isolated-local-client":
+                        owner.oauth_errors.append("invalid code, PKCE verifier, client, or refresh token")
+                        self.reply(400, {"error": "invalid_grant"})
+                        return
+                    self.reply(200, {"access_token": "new-token", "token_type": "Bearer", "expires_in": 3600,
+                                     "refresh_token": "new-refresh-token"})
+                    return
+                body = json.loads(raw_body)
+                request_record["rpc_method"] = body.get("method")
                 owner.requests.append({"body": body, "headers": dict(self.headers)})
+                if owner.registration_secret is not None:
+                    if self.path == "/register":
+                        owner.registration_requests.append(body)
+                        owner.registration_requested.set()
+                        if not owner.release_registration.wait(timeout=10):
+                            self.reply(503)
+                            return
+                        self.reply(400, {"client_secret": owner.registration_secret})
+                    else:
+                        origin = owner.url.removesuffix("/mcp")
+                        self.reply(401, {}, **{
+                            "WWW-Authenticate": f'Bearer resource_metadata="{origin}/.well-known/oauth-protected-resource"'})
+                    return
                 if owner.redirect:
                     self.reply(307, **{"Location": owner.redirect})
                     return
                 method = body["method"]
+                if owner.oauth_challenge is not None:
+                    if method == "tools/call":
+                        owner.side_effects.append(body["params"].get("arguments", {}))
+                    if method == owner.oauth_challenge and self.headers.get("Authorization") != "Bearer new-token":
+                        owner.challenges.append(body)
+                        origin = owner.url.removesuffix("/mcp")
+                        challenge = f'Bearer resource_metadata="{origin}/.well-known/oauth-protected-resource"'
+                        if owner.oauth_challenge_status == 403:
+                            challenge += ', error="insufficient_scope", scope="write"'
+                        self.reply(owner.oauth_challenge_status, {}, **{"WWW-Authenticate": challenge})
+                        return
                 if "id" not in body:
                     self.reply(202)
                     return
@@ -223,6 +332,7 @@ class _HTTPFixture:
         return self
 
     def __exit__(self, *_args):
+        self.release_registration.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -241,6 +351,59 @@ def _http_config(server: _HTTPFixture, home: Path, token: str) -> dict:
 def _payload(result: dict) -> dict:
     assert result["isError"] is False
     return json.loads(result["content"][0]["text"])
+
+
+def _oauth_config(server: _HTTPFixture, home: Path) -> dict:
+    return {
+        "transport": "http",
+        "url": server.url,
+        "auth": "oauth",
+        "headers": {"X-Profile-Home": str(home)},
+        "connect_timeout": 5,
+        "timeout": 5,
+    }
+
+
+async def _seed_oauth_cache(name: str, home: Path, server: _HTTPFixture, token: str, *,
+                           refresh_token: str | None = None, redirect_uri: str = "https://example.invalid/oauth/callback"):
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata, OAuthToken
+    from tools.mcp_oauth import HermesTokenStorage
+
+    home.mkdir(parents=True, exist_ok=True)
+    storage = HermesTokenStorage(name, hermes_home=home)
+    base_url = server.url.removesuffix("/mcp")
+    if refresh_token is not None:
+        storage.bind_issuer(base_url)
+    await storage.set_tokens(OAuthToken(access_token=token, expires_in=3600, refresh_token=refresh_token))
+    await storage.set_client_info(OAuthClientInformationFull(
+        client_id="isolated-local-client",
+        redirect_uris=[redirect_uri],
+        token_endpoint_auth_method="none",
+    ))
+    storage.save_oauth_metadata(OAuthMetadata(
+        issuer=base_url, authorization_endpoint=f"{base_url}/authorize", token_endpoint=f"{base_url}/token"))
+    return storage
+
+
+def _spy_global_oauth_and_cache_reads(monkeypatch):
+    from tools import mcp_oauth, mcp_oauth_manager
+
+    manager_lookups = []
+    cache_reads = []
+    real_get_manager = mcp_oauth_manager.get_manager
+    real_read_json = mcp_oauth._read_json
+
+    def get_manager():
+        manager_lookups.append(True)
+        return real_get_manager()
+
+    def read_json(path, **kwargs):
+        cache_reads.append(Path(path))
+        return real_read_json(path, **kwargs)
+
+    monkeypatch.setattr(mcp_oauth_manager, "get_manager", get_manager)
+    monkeypatch.setattr(mcp_oauth, "_read_json", read_json)
+    return manager_lookups, cache_reads
 
 
 def _deny_profile_config(reads: list):
@@ -333,6 +496,251 @@ def test_http_a_b_a_uses_each_clients_explicit_headers_and_profile(tmp_path, mon
             assert "sampling" not in handshake["params"]["capabilities"]
             assert "elicitation" not in handshake["params"]["capabilities"]
     assert config_reads == []
+
+
+def test_oauth_requires_explicit_home_before_ambient_cache_or_network(tmp_path, monkeypatch):
+    from tools import mcp_oauth_manager
+
+    name = "isolated-oauth-implicit"
+    ambient_home = tmp_path / "ambient"
+    manager = mcp_oauth_manager.get_manager()
+
+    async def scenario(server):
+        with _profile(ambient_home):
+            storage = await _seed_oauth_cache(name, ambient_home, server, "ambient-personal-token")
+            ambient_provider = manager.get_or_build_provider(name, server.url, None)
+            assert ambient_provider is not None
+            snapshot = storage.snapshot()
+            manager_lookups, cache_reads = _spy_global_oauth_and_cache_reads(monkeypatch)
+            client = IsolatedMCPClient(name)
+            try:
+                with pytest.raises(ValueError, match="oauth_home"):
+                    await client.start(_oauth_config(server, ambient_home))
+                assert manager_lookups == []
+                assert cache_reads == []
+                assert server.all_requests == []
+                assert storage.snapshot() == snapshot
+                assert manager.get_or_build_provider(name, server.url, None) is ambient_provider
+            finally:
+                await client.close()
+                manager.evict(name, hermes_home=ambient_home)
+
+    with _HTTPFixture() as server:
+        asyncio.run(scenario(server))
+
+
+def test_explicit_oauth_homes_keep_a_b_a_private_under_ambient_profile_switches(tmp_path, monkeypatch, caplog):
+    from tools import mcp_oauth_manager
+
+    name = "isolated-private-oauth"
+    ambient_homes = [tmp_path / "ambient-a", tmp_path / "ambient-b"]
+    private_homes = [tmp_path / "private-a", tmp_path / "private-b"]
+    private_tokens = ["private-oauth-a-token", "private-oauth-b-token"]
+    manager = mcp_oauth_manager.get_manager()
+
+    async def scenario(server):
+        ambient_stores = []
+        ambient_providers = []
+        for index, home in enumerate(ambient_homes):
+            with _profile(home):
+                ambient_stores.append(await _seed_oauth_cache(name, home, server, f"ambient-{index}-token"))
+                ambient_providers.append(manager.get_or_build_provider(name, server.url, None))
+        for home, token in zip(private_homes, private_tokens):
+            await _seed_oauth_cache(name, home, server, token)
+        snapshots = [storage.snapshot() for storage in ambient_stores]
+        manager_lookups, cache_reads = _spy_global_oauth_and_cache_reads(monkeypatch)
+        clients = []
+        try:
+            with caplog.at_level(logging.DEBUG):
+                for index, home in enumerate(private_homes):
+                    with _profile(ambient_homes[index]):
+                        client = IsolatedMCPClient(name, oauth_home=home)
+                        clients.append(client)
+                        await client.start(_oauth_config(server, home))
+                for index in (0, 1, 0):
+                    with _profile(ambient_homes[1 - index]):
+                        result = await clients[index].call_tool("echo", {"index": index})
+                    assert _payload(result) == {
+                        "authorization": f"Bearer {private_tokens[index]}",
+                        "home": str(private_homes[index]), "arguments": {"index": index}}
+                for index, home in enumerate(ambient_homes):
+                    with _profile(home):
+                        assert manager.get_or_build_provider(name, server.url, None) is ambient_providers[index]
+        finally:
+            for client in clients:
+                await client.close()
+            for home in ambient_homes:
+                manager.evict(name, hermes_home=home)
+        assert manager_lookups == []
+        assert cache_reads, "The real OAuth provider must read its explicit token storage"
+        assert all(any(path.is_relative_to(home) for home in private_homes) for path in cache_reads)
+        assert [storage.snapshot() for storage in ambient_stores] == snapshots
+        assert all(provider is not None for provider in ambient_providers)
+
+    with _HTTPFixture() as server:
+        asyncio.run(scenario(server))
+        calls = [request for request in server.requests if request["body"]["method"] == "tools/call"]
+        assert [request["headers"]["Authorization"] for request in calls] == [
+            f"Bearer {private_tokens[0]}", f"Bearer {private_tokens[1]}", f"Bearer {private_tokens[0]}"]
+    for private_value in (name, *map(str, private_homes), *private_tokens):
+        assert private_value not in caplog.text
+
+
+def test_private_oauth_registration_failure_hides_secret_without_muting_concurrent_sdk_logs(tmp_path, caplog):
+    from mcp.shared.auth import OAuthToken
+    from tools.mcp_oauth import HermesTokenStorage
+
+    registration_secret = "private-oauth-registration-response-0cc6cf"
+    normal_canary = "normal-concurrent-sdk-oauth-warning-e82f6d"
+    name = "isolated-oauth-registration-error"
+    private_home = tmp_path / "private"
+
+    async def scenario(server):
+        await HermesTokenStorage(name, hermes_home=private_home).set_tokens(
+            OAuthToken(access_token="synthetic-cached-oauth-token", expires_in=3600))
+        client = IsolatedMCPClient(name, oauth_home=private_home)
+
+        async def emit_normal_diagnostic():
+            requested = await asyncio.to_thread(server.registration_requested.wait, 5)
+            assert requested, "The real SDK must reach dynamic client registration"
+            logging.getLogger("mcp.client.auth.oauth2").warning(normal_canary)
+            server.release_registration.set()
+
+        ordinary_task = asyncio.create_task(emit_normal_diagnostic())
+        config = _oauth_config(server, private_home)
+        config["oauth"] = {"cimd": False, "redirect_port": 43210}
+        config["connect_timeout"] = 3
+        try:
+            with pytest.raises(Exception):
+                await asyncio.wait_for(client.start(config), timeout=8)
+            await ordinary_task
+            assert server.registration_requests
+            assert all(request.get("redirect_uris") for request in server.registration_requests)
+        finally:
+            server.release_registration.set()
+            if not ordinary_task.done():
+                ordinary_task.cancel()
+            await asyncio.gather(ordinary_task, return_exceptions=True)
+            await client.close()
+
+    with _HTTPFixture(registration_secret=registration_secret) as server:
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(scenario(server))
+    assert registration_secret not in caplog.text
+    assert normal_canary in caplog.text
+
+
+async def _complete_local_oauth_browser_flow(flow):
+    import httpx2
+
+    authorization_url = await flow.wait_for_authorization_url(timeout=5)
+    assert urlsplit(authorization_url).hostname == "127.0.0.1"
+    async with httpx2.AsyncClient(follow_redirects=True, trust_env=False) as browser:
+        response = await browser.get(authorization_url)
+    assert response.status_code == 200
+    assert response.json() == {"callback": "delivered"}
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_isolated_oauth_challenge_does_not_replay_a_tool_call_or_begin_authorization(tmp_path, status):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+
+    async def scenario(server):
+        name = "isolated-oauth-no-replay"
+        callback_url = server.url.removesuffix("/mcp") + "/callback"
+        await _seed_oauth_cache(name, tmp_path, server, "old-token", redirect_uri=callback_url)
+        flow = DashboardOAuthFlow(flow_id="local-isolated", server_name=name, profile=None,
+                                  hermes_home=str(tmp_path), redirect_uri=callback_url)
+        server.oauth_flow = flow
+        client = IsolatedMCPClient(name, oauth_home=tmp_path)
+        try:
+            with dashboard_oauth_flow(flow):
+                await client.start(_oauth_config(server, tmp_path))
+                with pytest.raises(Exception):
+                    await client.call_tool("echo", {"nonce": "one-side-effect"}, timeout=3)
+            assert server.side_effects == [{"nonce": "one-side-effect"}]
+            assert len(server.challenges) == 1
+            assert flow.authorization_url is None
+            assert server.authorization_requests == []
+            assert server.callback_requests == []
+            assert server.token_requests == []
+            assert server.oauth_errors == []
+        finally:
+            flow.mark_error("test cleanup", cancelled=True)
+            await client.close()
+
+    with _HTTPFixture(oauth_challenge="tools/call", oauth_challenge_status=status) as server:
+        asyncio.run(scenario(server))
+
+
+def test_isolated_oauth_refreshes_an_expired_token_before_sending_one_tool_call(tmp_path):
+    from mcp.shared.auth import OAuthToken
+
+    async def scenario(server):
+        name = "isolated-oauth-preflight-refresh"
+        storage = await _seed_oauth_cache(name, tmp_path, server, "old-token", refresh_token="refresh-token")
+        client = IsolatedMCPClient(name, oauth_home=tmp_path)
+        try:
+            await client.start(_oauth_config(server, tmp_path))
+            await storage.set_tokens(OAuthToken(
+                access_token="expired-token", expires_in=0, refresh_token="refresh-token"))
+            result = await client.call_tool("echo", {"nonce": "refresh-before-dispatch"}, timeout=5)
+            assert _payload(result)["authorization"] == "Bearer new-token"
+            assert server.side_effects == [{"nonce": "refresh-before-dispatch"}]
+            assert [form["grant_type"] for form in server.token_requests] == ["refresh_token"]
+            assert server.challenges == []
+            assert server.authorization_requests == []
+            assert server.callback_requests == []
+            methods = ["token" if request["path"] == "/token" else request.get("rpc_method")
+                       for request in server.all_requests]
+            assert methods.index("token") < methods.index("tools/call")
+            assert server.oauth_errors == []
+        finally:
+            await client.close()
+
+    with _HTTPFixture(oauth_challenge="tools/call") as server:
+        asyncio.run(scenario(server))
+
+
+def test_native_oauth_can_reauthorize_and_retry_tool_discovery(tmp_path):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import MCPServerTask
+
+    async def scenario(server):
+        name = "native-oauth-discovery-retry"
+        callback_url = server.url.removesuffix("/mcp") + "/callback"
+        await _seed_oauth_cache(name, tmp_path, server, "old-token", redirect_uri=callback_url)
+        flow = DashboardOAuthFlow(flow_id="local-native", server_name=name, profile=None,
+                                  hermes_home=str(tmp_path), redirect_uri=callback_url)
+        server.oauth_flow = flow
+        native = MCPServerTask(name)
+        browser = None
+        try:
+            with _profile(tmp_path), dashboard_oauth_flow(flow):
+                browser = asyncio.create_task(_complete_local_oauth_browser_flow(flow))
+                config = _oauth_config(server, tmp_path)
+                config["skip_preflight"] = True
+                await asyncio.wait_for(native.start(config), timeout=8)
+                await browser
+            listings = [request for request in server.requests if request["body"].get("method") == "tools/list"]
+            assert [request["headers"]["Authorization"] for request in listings] == [
+                "Bearer old-token", "Bearer new-token"]
+            assert len(server.challenges) == 1
+            assert len(server.authorization_requests) == 1
+            assert len(server.callback_requests) == 1
+            assert [form["grant_type"] for form in server.token_requests] == ["authorization_code"]
+            assert server.oauth_errors == []
+        finally:
+            flow.mark_error("test cleanup", cancelled=True)
+            if browser is not None and not browser.done():
+                browser.cancel()
+                await asyncio.gather(browser, return_exceptions=True)
+            await native.shutdown()
+            get_manager().evict(name, hermes_home=tmp_path)
+
+    with _HTTPFixture(oauth_challenge="tools/list") as server:
+        asyncio.run(scenario(server))
 
 
 def test_stdio_list_changed_updates_only_the_isolated_discovery(tmp_path):

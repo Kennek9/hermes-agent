@@ -277,7 +277,7 @@ def _reserve_callback_port() -> int:
 def _cached_client_info(storage: "HermesTokenStorage | None") -> dict | None:
     """The on-disk client registration for *storage*, or None."""
     try:
-        info = _read_json(storage._client_info_path()) if storage is not None else None
+        info = _read_json(storage._client_info_path(), diagnostic_logger=storage._logger) if storage is not None else None
     except (AttributeError, TypeError, ValueError):
         return None
     # A non-object payload is not a registration get_client_info could ever load, so callers
@@ -382,14 +382,15 @@ def _can_open_browser() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _read_json(path: Path) -> dict | None:
+def _read_json(path: Path, *, diagnostic_logger: logging.Logger | None = None) -> dict | None:
     """Read a JSON file, returning None if it doesn't exist or is invalid."""
     if not path.exists():
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to read %s: %s", path, exc)
+        log = diagnostic_logger if diagnostic_logger is not None else logger
+        log.warning("Failed to read %s: %s", path, exc)
         return None
 
 
@@ -412,9 +413,11 @@ class HermesTokenStorage:
     """Persist OAuth state as ``HERMES_HOME/mcp-tokens/<server_name>`` + ``.json`` (tokens),
     ``.client.json`` (client info), ``.meta.json`` (server metadata), ``.cimd-off`` (CIMD refused)."""
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None,
+                 diagnostic_logger: logging.Logger | None = None):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._logger = diagnostic_logger if diagnostic_logger is not None else logger
         # Issuer binding: ``loaded_issuer`` is what the token file on disk recorded (the authorization
         # server that granted the stored refresh token); ``_bound_issuer`` is stamped onto the next
         # ``set_tokens`` write. See ``tools.mcp_oauth_provider.enforce_refresh_token_issuer``.
@@ -432,15 +435,14 @@ class HermesTokenStorage:
     def _state_paths(self) -> tuple[Path, Path, Path]:
         return self._tokens_path(), self._client_info_path(), self._meta_path()
 
-    @staticmethod
-    def _load_model(path: Path, sdk_name: str, label: str, fixup=None):
+    def _load_model(self, path: Path, sdk_name: str, label: str, fixup=None):
         """Read *path* into SDK model *sdk_name*; None if absent, no SDK, or corrupt.
         ``fixup(data)`` may rewrite the raw dict before validation."""
-        data = _read_json(path)
+        data = _read_json(path, diagnostic_logger=self._logger)
         if data is not None and not isinstance(data, dict):
             # A non-object payload (list/str/number) has no fields for the fixups' ``.get``/``.pop``
             # and cannot validate: treat it like any other corrupt file instead of crashing auth init.
-            logger.warning("Corrupt %s at %s -- ignoring: expected a JSON object, got %s",
+            self._logger.warning("Corrupt %s at %s -- ignoring: expected a JSON object, got %s",
                            label, path, type(data).__name__)
             return None
         cls = _sdk_class(sdk_name) if data is not None else None
@@ -461,7 +463,7 @@ class HermesTokenStorage:
             if hasattr(exc, "errors"):  # pydantic ValidationError
                 detail = "validation failed for " + ", ".join(
                     ".".join(map(str, e.get("loc", ()))) for e in exc.errors(include_input=False))
-            logger.warning("Corrupt %s at %s -- ignoring: %s", label, path, detail)
+            self._logger.warning("Corrupt %s at %s -- ignoring: %s", label, path, detail)
             return None
 
     def _rebase_expires_in(self, data: dict) -> None:
@@ -496,7 +498,7 @@ class HermesTokenStorage:
             payload["hermes_issuer"] = self._bound_issuer
             self.loaded_issuer = self._bound_issuer
         _write_json(self._tokens_path(), payload)
-        logger.debug("OAuth tokens saved for %s", self._server_name)
+        self._logger.debug("OAuth tokens saved for %s", self._server_name)
 
     def bind_issuer(self, issuer: str | None) -> None:
         """Set the authorization-server issuer stamped on future token writes."""
@@ -505,14 +507,14 @@ class HermesTokenStorage:
     def stamp_issuer(self, issuer: str) -> None:
         """Backfill ``hermes_issuer`` onto a pre-binding token file: adopt the currently discovered
         issuer once instead of forcing a re-login, so the *next* read is protected."""
-        data = _read_json(self._tokens_path())
+        data = _read_json(self._tokens_path(), diagnostic_logger=self._logger)
         if data is None or data.get("hermes_issuer"):
             return
         data["hermes_issuer"] = str(issuer)
         try:
             _write_json(self._tokens_path(), data)
         except OSError as exc:  # non-fatal — worst case we stamp next time
-            logger.debug("Could not stamp issuer on tokens for %s: %s", self._server_name, exc)
+            self._logger.debug("Could not stamp issuer on tokens for %s: %s", self._server_name, exc)
             return
         self.loaded_issuer = str(issuer)
 
@@ -520,7 +522,7 @@ class HermesTokenStorage:
         """Drop the refresh token (and its issuer record) from disk, keeping the access token: the
         unexpired access token may still be used, but a refresh token must never go to a different
         issuer than the one that granted it."""
-        data = _read_json(self._tokens_path())
+        data = _read_json(self._tokens_path(), diagnostic_logger=self._logger)
         if data is None or not data.get("refresh_token"):
             return
         data.pop("refresh_token", None)
@@ -529,9 +531,9 @@ class HermesTokenStorage:
         try:
             _write_json(self._tokens_path(), data)
         except OSError as exc:
-            logger.warning("Could not strip refresh token for %s: %s", self._server_name, exc)
+            self._logger.warning("Could not strip refresh token for %s: %s", self._server_name, exc)
             return
-        logger.info("Removed issuer-mismatched refresh token for %s (re-authorization will be required "
+        self._logger.info("Removed issuer-mismatched refresh token for %s (re-authorization will be required "
                     "when the access token expires)", self._server_name)
 
     @staticmethod
@@ -557,13 +559,13 @@ class HermesTokenStorage:
         data = _model_json(client_info)
         self._coerce_secret_auth_method(data)
         _write_json(self._client_info_path(), data)
-        logger.debug("OAuth client info saved for %s", self._server_name)
+        self._logger.debug("OAuth client info saved for %s", self._server_name)
 
     def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
         """Persist server metadata so a restarted process can refresh without re-discovery;
         otherwise the SDK guesses ``{server_url}/token`` (404) and forces re-auth."""
         _write_json(self._meta_path(), _model_json(metadata))
-        logger.debug("OAuth metadata saved for %s", self._server_name)
+        self._logger.debug("OAuth metadata saved for %s", self._server_name)
 
     def load_oauth_metadata(self) -> "OAuthMetadata | None":
         return self._load_model(self._meta_path(), "OAuthMetadata", "OAuth metadata")
@@ -578,7 +580,7 @@ class HermesTokenStorage:
             mkdir_under_hermes_home(path.parent)
             path.touch()
         except OSError as exc:  # non-fatal — worst case we retry CIMD later
-            logger.debug("Could not record CIMD rejection at %s: %s", path, exc)
+            self._logger.debug("Could not record CIMD rejection at %s: %s", path, exc)
 
     def cimd_rejected(self) -> bool:
         """True when this server has refused our metadata document before."""
@@ -606,7 +608,7 @@ class HermesTokenStorage:
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
         if only_if_absent and any(path.exists() for path in self._state_paths()):
-            logger.info("Skipping OAuth rollback for %s because newer state exists", self._server_name)
+            self._logger.info("Skipping OAuth rollback for %s because newer state exists", self._server_name)
             return
         self.remove()
         if not snapshot:
@@ -621,7 +623,7 @@ class HermesTokenStorage:
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(data)
             except OSError as exc:
-                logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
+                self._logger.warning("Failed to restore OAuth state %s: %s", fname, exc)
 
     def poison_client_registration(self) -> bool:
         """Discard a dead DCR client (``invalid_client`` at the token endpoint) plus stale ``meta.json``
@@ -634,10 +636,10 @@ class HermesTokenStorage:
         try:
             backup.write_bytes(client_path.read_bytes())
         except OSError as exc:  # non-fatal — proceed with the removal anyway
-            logger.warning("Could not back up client info at %s: %s", client_path, exc)
+            self._logger.warning("Could not back up client info at %s: %s", client_path, exc)
         client_path.unlink(missing_ok=True)
         self._meta_path().unlink(missing_ok=True)
-        logger.warning(
+        self._logger.warning(
             "MCP OAuth '%s': cached client registration rejected as invalid_client; "
             "removed client.json + meta.json (backup at %s) to force re-registration",
             self._server_name, backup.name)
@@ -1101,13 +1103,15 @@ def _is_figma_remote_mcp(server_name: str | None = None, server_url: str | None 
     return "figma" in (server_name or "").lower() and (not url or "figma" in base_url_hostname(url))
 
 
-def apply_oauth_provider_defaults(cfg: dict, *, server_name: str = "", server_url: str | None = None) -> dict:
+def apply_oauth_provider_defaults(cfg: dict, *, server_name: str = "", server_url: str | None = None,
+                                  diagnostic_logger: logging.Logger | None = None) -> dict:
     """Mutate *cfg* with provider-specific OAuth workarounds (before building client metadata /
     pre-registering); returns *cfg*. Only fills keys the user left unset — explicit values win."""
     if _is_figma_remote_mcp(server_name, server_url):
         if not cfg.get("client_name"):
             cfg["client_name"] = _FIGMA_DCR_CLIENT_NAME
-            logger.info(
+            log = diagnostic_logger if diagnostic_logger is not None else logger
+            log.info(
                 "MCP OAuth '%s': Figma DCR allowlist — registering as client_name=%r (override via oauth.client_name)",
                 server_name or server_url, _FIGMA_DCR_CLIENT_NAME)
         if not cfg.get("scope"):
@@ -1154,7 +1158,7 @@ def _invalidate_tokens_on_client_change(
     Matching identity is a no-op so live sessions and valid tokens are preserved. Port of
     cline/cline#12983's "invalidate tokens when OAuth client changes" invariant.
     """
-    existing = _read_json(storage._client_info_path())
+    existing = _read_json(storage._client_info_path(), diagnostic_logger=storage._logger)
     old_client_id = existing.get("client_id") if isinstance(existing, dict) else None
     if not old_client_id or (old_client_id == new_client_id and (existing.get("client_secret") or None) == (new_client_secret or None)):
         return
@@ -1166,9 +1170,9 @@ def _invalidate_tokens_on_client_change(
             path.unlink()
             removed = True
         except OSError as exc:  # non-fatal — stale tokens fail later anyway
-            logger.warning("MCP OAuth '%s': could not remove stale %s after client change: %s", storage._server_name, path.name, exc)
+            storage._logger.warning("MCP OAuth '%s': could not remove stale %s after client change: %s", storage._server_name, path.name, exc)
     if removed:
-        logger.warning(
+        storage._logger.warning(
             "MCP OAuth '%s': configured OAuth client changed (client_id %r -> %r); discarded tokens minted under "
             "the previous client. Re-authorize with: hermes mcp login %s",
             storage._server_name, old_client_id, new_client_id, storage._server_name)
@@ -1189,7 +1193,7 @@ def _maybe_preregister_client(storage: "HermesTokenStorage", cfg: dict, client_m
         "token_endpoint_auth_method": client_metadata.token_endpoint_auth_method,
         **{key: cfg[key] for key in ("client_secret", "client_name", "scope") if cfg.get(key)}}
     _write_json(storage._client_info_path(), _model_json(info_cls.model_validate(info_dict)))
-    logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
+    storage._logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
 
 
 def humanize_oauth_registration_error(

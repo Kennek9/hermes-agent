@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, TextIO
 
 from tools.mcp_tool import MCPServerTask
@@ -25,9 +26,11 @@ class IsolatedMCPClient:
     """
 
     def __init__(self, name: str, *, stderr: TextIO | None = None,
-                 follow_redirects: bool = False):
+                 follow_redirects: bool = False, oauth_home: str | Path | None = None):
+        owned_oauth_home = Path(oauth_home).expanduser().resolve() if oauth_home is not None else None
         self._server = MCPServerTask(
-            name, isolated=True, stderr=stderr, follow_redirects=follow_redirects)
+            name, isolated=True, stderr=stderr, follow_redirects=follow_redirects,
+            oauth_home=owned_oauth_home)
         self._started = False
         self._closed = False
         self._close_task: asyncio.Task | None = None
@@ -36,6 +39,8 @@ class IsolatedMCPClient:
         """Connect and discover using a private copy of the supplied definition."""
         if self._started or self._closed:
             raise RuntimeError("An isolated MCP client can only be started once")
+        if str(config.get("auth", "")).lower().strip() == "oauth" and self._server._oauth_home is None:
+            raise ValueError("Isolated MCP OAuth requires an explicit oauth_home")
         self._started = True
         definition = deepcopy(config)
         # The initialize exchange is authoritative; a separate probe adds requests

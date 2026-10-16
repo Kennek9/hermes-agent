@@ -318,14 +318,16 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
         "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line",
-        "_isolated", "_stderr", "_follow_redirects", "_logger")
+        "_isolated", "_stderr", "_follow_redirects", "_logger", "_oauth_home", "_oauth_manager")
 
     def __init__(self, name: str, *, isolated: bool = False, stderr: Optional[Any] = None,
-                 follow_redirects: bool = True):
+                 follow_redirects: bool = True, oauth_home: str | os.PathLike[str] | None = None):
         self.name = name
         self._isolated = isolated
         self._stderr = stderr
         self._follow_redirects = follow_redirects
+        self._oauth_home = oauth_home
+        self._oauth_manager = None
         # Personal-server diagnostics can contain credentials and private tool data.
         # A private Logger avoids changing logging for other connections in this process.
         self._logger = logging.Logger("tools.mcp_isolated.transport") if isolated else logger

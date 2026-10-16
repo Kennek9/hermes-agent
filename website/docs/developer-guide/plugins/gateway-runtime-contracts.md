@@ -74,12 +74,15 @@ A cleared interrupt bit cannot revive an older request. Consumers also call
 `ctx.is_interrupted()` immediately before dispatching an approved write.
 
 Callers that own a private connector policy can use
-`tools.mcp_isolated.IsolatedMCPClient(name, stderr=None, follow_redirects=False)`.
+`tools.mcp_isolated.IsolatedMCPClient(name, stderr=None, follow_redirects=False, oauth_home=None)`.
 Its public lifecycle is `await start(config)`, `discovered_tools()`,
 `await call_tool(name, arguments, timeout=...)`, and `await close()`.
 The connection never publishes schemas into the user's registry, never replaces its
 explicit endpoint from profile config, and never automatically replays a dispatched
-tool call. The caller still owns its tool allowlist, argument validation and write
-authorization. Provider stderr is discarded by default.
-OAuth additionally requires an explicit `oauth_home` owned by that connection. It
-never inherits a same-named provider or token from the user's active Hermes profile.
+tool call, including after an OAuth 401 or 403 response. Token refresh before dispatch
+and authentication recovery for initialization and tool discovery remain available.
+The caller still owns its tool allowlist, argument validation and write authorization.
+Provider stderr is discarded by default.
+OAuth requires an explicit `oauth_home` owned by that connection; without it, `start`
+raises `ValueError` before reading token caches or sending network requests. It never
+inherits a same-named provider or token from the user's active Hermes profile.

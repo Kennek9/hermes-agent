@@ -648,6 +648,11 @@ def _fenced_provider(tmp_path, monkeypatch, endpoint):
     provider.context.client_info = OAuthClientInformationFull.model_validate(
         {"client_id": "client-id", "redirect_uris": ["http://localhost/cb"]}
     )
+    # Disk-watch reloads now use this provider's own manager. Persist the same
+    # registration and metadata a real initialized provider would have loaded.
+    storage = provider.context.storage
+    storage.save_oauth_metadata(provider.context.oauth_metadata)
+    storage._client_info_path().write_text(provider.context.client_info.model_dump_json())
     provider.context.current_tokens = _token("A1", "R1")
     provider.context.token_expiry_time = time.time() - 10
     return provider
@@ -681,7 +686,7 @@ async def test_concurrent_refresh_presents_single_use_token_exactly_once(tmp_pat
     a = _fenced_provider(tmp_path, monkeypatch, endpoint)
     b = _fenced_provider(tmp_path, monkeypatch, endpoint)
     assert a is not b
-    await a.context.storage.set_tokens(_token("A1", "R1"))
+    await a.context.storage.set_tokens(_token("A1", "R1", expires_in=0))
 
     presented = []
 
@@ -714,7 +719,7 @@ async def test_refresh_fails_closed_while_a_peer_holds_the_fence(tmp_path, monke
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     endpoint = "https://idp.example.com/oauth/token"
     provider = _fenced_provider(tmp_path, monkeypatch, endpoint)
-    await provider.context.storage.set_tokens(_token("A1", "R1"))
+    await provider.context.storage.set_tokens(_token("A1", "R1", expires_in=0))
     monkeypatch.setattr(
         mcp_oauth, "acquire_refresh_fence", functools.partial(mcp_oauth.acquire_refresh_fence, timeout=0.2)
     )

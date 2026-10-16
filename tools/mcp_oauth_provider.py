@@ -10,12 +10,52 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from tools.mcp_oauth import HermesTokenStorage
 logger = logging.getLogger(__name__)
+
+# The SDK uses module loggers rather than a provider-owned logger. Route only
+# records emitted while advancing an isolated provider, without changing the
+# SDK logger's level or filtering another task's OAuth diagnostics.
+_sdk_oauth_diagnostic_logger: ContextVar[logging.Logger | None] = ContextVar(
+    "mcp_sdk_oauth_diagnostic_logger", default=None)
+_sdk_log_router_lock = threading.Lock()
+
+
+class _ScopedOAuthLogRouter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        destination = _sdk_oauth_diagnostic_logger.get()
+        if destination is None:
+            return True
+        destination.handle(record)
+        return False
+
+
+_sdk_log_router = _ScopedOAuthLogRouter()
+
+
+@contextmanager
+def _sdk_oauth_diagnostics(destination: logging.Logger | None):
+    if destination is None:
+        yield
+        return
+    with _sdk_log_router_lock:
+        for name in ("mcp.client.auth.oauth2", "mcp.client.auth.utils"):
+            sdk_logger = logging.getLogger(name)
+            if _sdk_log_router not in sdk_logger.filters:
+                sdk_logger.addFilter(_sdk_log_router)
+    token = _sdk_oauth_diagnostic_logger.set(destination)
+    try:
+        yield
+    finally:
+        _sdk_oauth_diagnostic_logger.reset(token)
 
 # Authorization servers that advertise ``authorization_response_iss_parameter_supported`` and then
 # omit ``iss`` from the redirect (#111135). Exact issuer match, nothing else is relaxed.
@@ -86,6 +126,7 @@ class HermesProviderMixin:
     - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
 
     _hermes_logger: logging.Logger = logger
+    _hermes_diagnostic_logger: logging.Logger | None = None
 
     def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -246,11 +287,12 @@ class HermesProviderMixin:
                 sent, thrown = None, None
                 while True:
                     try:
-                        if thrown is not None:
-                            exc, thrown = thrown, None
-                            out = await inner.athrow(exc)
-                        else:
-                            out = await inner.asend(sent)
+                        with _sdk_oauth_diagnostics(self._hermes_diagnostic_logger):
+                            if thrown is not None:
+                                exc, thrown = thrown, None
+                                out = await inner.athrow(exc)
+                            else:
+                                out = await inner.asend(sent)
                     except StopAsyncIteration:
                         return
                     except _RefreshCompletedByPeer:
@@ -394,7 +436,7 @@ class HermesProviderMixin:
         """
         self.context.current_tokens = tokens
         self.context.update_token_expiry(tokens)
-        enforce_refresh_token_issuer(self.context)
+        enforce_refresh_token_issuer(self.context, diagnostic_logger=self._hermes_logger)
         return bool(getattr(self.context.current_tokens, "refresh_token", None))
 
     async def _initialize(self) -> None:
@@ -408,7 +450,7 @@ class HermesProviderMixin:
             meta = storage.load_oauth_metadata()
             if meta is not None:
                 self.context.oauth_metadata = meta
-        enforce_refresh_token_issuer(self.context)
+        enforce_refresh_token_issuer(self.context, diagnostic_logger=self._hermes_logger)
 
     async def _store_tokens(self, token_response) -> None:
         self.context.current_tokens = token_response
@@ -575,7 +617,7 @@ def bind_issuer_from_context(context: Any) -> None:
         storage.bind_issuer(issuer)
 
 
-def enforce_refresh_token_issuer(context: Any) -> None:
+def enforce_refresh_token_issuer(context: Any, *, diagnostic_logger: logging.Logger | None = None) -> None:
     """Refuse to reuse a refresh token minted by a different issuer.
 
     The authorization server discovered for an MCP server can change (DNS takeover, protected-resource
@@ -597,20 +639,28 @@ def enforce_refresh_token_issuer(context: Any) -> None:
         storage.stamp_issuer(current)
         return
     if stored != current:
-        logger.warning("MCP OAuth: authorization server issuer changed (%s -> %s); dropping the stored "
-                       "refresh token rather than sending it to a different issuer", stored, current)
+        log = diagnostic_logger if diagnostic_logger is not None else logger
+        log.warning("MCP OAuth: authorization server issuer changed (%s -> %s); dropping the stored "
+                    "refresh token rather than sending it to a different issuer", stored, current)
         storage.strip_refresh_token()
         tokens.refresh_token = None
 
 
-def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict | None) -> tuple[dict, "HermesTokenStorage"]:
+def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict | None, *,
+                         hermes_home: str | Path | None = None,
+                         diagnostic_logger: logging.Logger | None = None) -> tuple[dict, "HermesTokenStorage"]:
     """Copy the ``oauth:`` block, apply provider defaults, open its token storage. The copy
     matters: later steps record ``_resolved_port`` / ``_cimd_url`` in the dict, which must
     never leak back into the caller's config."""
     from tools import mcp_oauth as mo
     cfg = dict(oauth_config or {})
-    mo.apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url)
-    return cfg, mo.HermesTokenStorage(server_name)
+    logging_options = {"diagnostic_logger": diagnostic_logger} if diagnostic_logger is not None else {}
+    mo.apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url, **logging_options)
+    storage_options = dict(logging_options)
+    if hermes_home is not None:
+        storage_options["hermes_home"] = hermes_home
+    storage = mo.HermesTokenStorage(server_name, **storage_options)
+    return cfg, storage
 
 
 def build_provider_kwargs(cfg: dict, storage: "HermesTokenStorage", *, ssh_proxy_hint: bool) -> dict[str, Any]:

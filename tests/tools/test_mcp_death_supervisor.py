@@ -584,114 +584,104 @@ def test_a_supervisor_that_cannot_start_is_not_fatal(monkeypatch, all_groups_ali
 
 
 @contextlib.contextmanager
-def _stdio_connection(child_pid, fake_supervisor):
-    """Drive the real MCPServerTask._run_stdio with a known spawned child.
+def _stdio_connection(fake_supervisor):
+    """Drive native tracking against children spawned with the SDK parameters.
 
-    Only the MCP transport itself is mocked. Everything the supervisor wiring
-    depends on -- child discovery, _filter_mcp_children, the real os.getpgid
-    lookup -- runs for real against ``child_pid``, so the pgid asserted on is
-    the pgid of an actual process rather than a fixture value.
+    The protocol session is stubbed; PID discovery, instance environment,
+    process creation time and process group lookups all use the real child.
+    Teardown deliberately leaves it alive to exercise the supervisor contract.
     """
     session = MagicMock()
     session.initialize = AsyncMock()
     session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+    children = []
 
-    stdio_cm = MagicMock()
-    stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
-    stdio_cm.__aexit__ = AsyncMock(return_value=False)
+    @contextlib.asynccontextmanager
+    async def stdio_client(parameters, **_kwargs):
+        child = subprocess.Popen(
+            [parameters.command, *parameters.args], env=parameters.env,
+            cwd=parameters.cwd, start_new_session=True)
+        children.append(child)
+        yield object(), object()
+
     session_cm = MagicMock()
     session_cm.__aenter__ = AsyncMock(return_value=session)
     session_cm.__aexit__ = AsyncMock(return_value=False)
 
-    with (
-        patch("tools.mcp_tool.stdio_client", return_value=stdio_cm),
-        patch("tools.mcp_tool.ClientSession", return_value=session_cm),
-        # First call is the pids_before baseline; the second reports our child
-        # as the newly spawned server.
-        patch(
-            "tools.mcp_tool_lifecycle._snapshot_child_pids",
-            side_effect=[set(), {child_pid}],
-        ),
-        patch("tools.mcp_tool_config._write_stderr_log_header"),
-        patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
-        patch(
-            "tools.mcp_tool._spawn_death_supervisor",
-            return_value=fake_supervisor,
-        ),
-    ):
-        yield mcp_tool.MCPServerTask("supervisor-wiring")
+    try:
+        with (
+            patch("tools.mcp_tool.stdio_client", stdio_client),
+            patch("tools.mcp_tool.ClientSession", return_value=session_cm),
+            patch("tools.mcp_tool_config._write_stderr_log_header"),
+            patch("tools.mcp_tool._get_mcp_stderr_log", return_value=None),
+            patch(
+                "tools.mcp_tool._spawn_death_supervisor",
+                return_value=fake_supervisor,
+            ),
+        ):
+            yield mcp_tool.MCPServerTask("supervisor-wiring"), children
+    finally:
+        for child in children:
+            _kill(child.pid)
+            child.wait(timeout=10)
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
 def test_connecting_a_stdio_server_registers_its_real_process_group():
     fake = _FakeSupervisor()
-    child = subprocess.Popen(_VICTIM, start_new_session=True)
-    try:
-        with _stdio_connection(child.pid, fake) as server:
-            asyncio.run(server.start({"command": "echo", "args": ["hi"]}))
-
+    with _stdio_connection(fake) as (server, children):
+        asyncio.run(server.start({"command": _VICTIM[0], "args": _VICTIM[1:]}))
+        child = children[0]
         assert f"register {os.getpgid(child.pid)}" in fake.lines(), (
             "connecting a stdio server did not hand its process group to the "
             f"supervisor; control stream was {fake.lines()}"
         )
-    finally:
-        _kill(child.pid)
-        child.wait(timeout=10)
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
 def test_a_server_that_exited_is_released_on_teardown():
     fake = _FakeSupervisor()
-    child = subprocess.Popen(_VICTIM, start_new_session=True)
     pgid = None
-    try:
-        with _stdio_connection(child.pid, fake) as server:
+    with _stdio_connection(fake) as (server, children):
 
-            async def _connect_then_lose_the_child():
-                await server.start({"command": "echo", "args": ["hi"]})
-                nonlocal pgid
-                pgid = os.getpgid(child.pid)
-                # The server exits while connected. Reap it here so the
-                # teardown path sees a genuinely dead pid, not a zombie.
-                child.kill()
-                child.wait(timeout=10)
-                await server.shutdown()
+        async def _connect_then_lose_the_child():
+            await server.start({"command": _VICTIM[0], "args": _VICTIM[1:]})
+            child = children[0]
+            nonlocal pgid
+            pgid = os.getpgid(child.pid)
+            # Reap it so teardown observes a dead pid rather than a zombie.
+            child.kill()
+            child.wait(timeout=10)
+            await server.shutdown()
 
-            asyncio.run(_connect_then_lose_the_child())
+        asyncio.run(_connect_then_lose_the_child())
 
         assert f"register {pgid}" in fake.lines()
         assert f"unregister {pgid}" in fake.lines(), (
             "a stdio server with nothing left alive stayed registered, so the "
             f"supervisor would keep a stale group; stream was {fake.lines()}"
         )
-    finally:
-        _kill(child.pid)
 
 
 @pytest.mark.skipif(not mcp_tool._MCP_AVAILABLE, reason="MCP SDK not installed")
 def test_a_server_that_survived_teardown_stays_registered():
-    # The case the whole module exists for: teardown did not manage to kill it.
-    # Releasing it here would hand the orphan back to nobody.
+    # Teardown failed to kill it; keep coverage for an ungraceful parent exit.
     fake = _FakeSupervisor()
-    child = subprocess.Popen(_VICTIM, start_new_session=True)
-    try:
-        with _stdio_connection(child.pid, fake) as server:
+    with _stdio_connection(fake) as (server, children):
 
-            async def _connect_then_shutdown():
-                await server.start({"command": "echo", "args": ["hi"]})
-                await server.shutdown()
+        async def _connect_then_shutdown():
+            await server.start({"command": _VICTIM[0], "args": _VICTIM[1:]})
+            await server.shutdown()
 
-            asyncio.run(_connect_then_shutdown())
+        asyncio.run(_connect_then_shutdown())
 
+        child = children[0]
         pgid = os.getpgid(child.pid)
         assert f"register {pgid}" in fake.lines()
         assert f"unregister {pgid}" not in fake.lines(), (
             "a server that outlived teardown was released from the supervisor, "
             "so an ungraceful exit would leave it running forever"
         )
-    finally:
-        _kill(child.pid)
-        child.wait(timeout=10)
 
 
 @pytest.mark.live_system_guard_bypass
