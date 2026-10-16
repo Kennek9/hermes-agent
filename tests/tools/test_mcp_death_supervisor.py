@@ -353,12 +353,14 @@ class _FakeSupervisor:
         self._exited = exited
         self._sent = ""
         self.closed = False
-        _real_close = self.stdin.close
+        stream = self.stdin
+        _real_close = stream.close
 
         def _close():
             # Mirror a real pipe: capture what was written before the write
             # end goes away, so tests can still assert on the control stream.
-            self._sent = self.stdin.getvalue()
+            if not stream.closed:
+                self._sent = stream.getvalue()
             self.closed = True
             _real_close()
 

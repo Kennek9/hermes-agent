@@ -50,11 +50,10 @@ def _stdio_spawn_roots(pids: Set[int], spawn_token: str) -> Set[int]:
     for pid in roots:
         try:
             child = psutil.Process(pid)
-            created_at = child.create_time()
             if child.ppid() != os.getpid() or child.environ().get(_STDIO_SPAWN_TOKEN_ENV) != spawn_token:
                 continue
-            # Do not bind a recycled PID if the root exited during inspection.
-            if psutil.Process(pid).create_time() != created_at:
+            # is_running rejects PID reuse without comparing clock-adjusted epoch times.
+            if not child.is_running():
                 continue
         except (psutil.Error, OSError):
             # A snapshot delta alone cannot authorize signals to this process.
