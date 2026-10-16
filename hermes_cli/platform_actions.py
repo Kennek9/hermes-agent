@@ -259,6 +259,30 @@ class PlatformActions:
         self._audit(method, "slack", result)
         return result
 
+    async def set_slack_thread_status(
+        self, workspace_id: str, channel_id: str, thread_ts: str, status: str,
+    ) -> Dict[str, Any]:
+        """Change assistant status without widening the read-only source API."""
+        if not isinstance(status, str):
+            return _err("invalid_argument")
+        adapter, error = self._gate(
+            "slack", workspace_id=workspace_id, channel_id=channel_id, thread_ts=thread_ts,
+        )
+        if error is not None or adapter is None:
+            return error or _err("gateway_unavailable")
+
+        async def change() -> Dict[str, Any]:
+            try:
+                if await adapter.set_plugin_thread_status(workspace_id, channel_id, thread_ts, status):
+                    return _ok(action="set_thread_status")
+            except Exception:
+                logger.warning("Plugin Slack status failed for %s", self._plugin_id)
+            return _err("status_unavailable")
+
+        result = await self._on_gateway_loop(change)
+        self._audit("set_thread_status", "slack", result)
+        return result
+
     def _audit(self, verb: str, platform: str, result: Dict[str, Any]) -> None:
         """Every platform action is logged (the #64176 'all actions logged' rule)."""
         logger.info(

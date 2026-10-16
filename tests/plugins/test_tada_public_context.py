@@ -167,3 +167,42 @@ async def test_source_reread_is_read_only_exact_workspace_and_host_loop(tmp_path
     assert (await ctx.call_slack_api("UNKNOWN", "conversations.history"))["error"] == "workspace_unavailable"
     assert (await ctx.call_slack_api("T_A", "chat.delete"))["error"] == "unsupported_platform_action"
     assert client.api_call.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("modern", [False, True])
+async def test_status_api_keeps_exact_workspace_thread_and_host_loop(tmp_path, monkeypatch, modern):
+    import gateway.run
+    import plugins.platforms.slack.adapter as slack_adapter
+
+    ctx = context(tmp_path)
+    host = asyncio.get_running_loop()
+    calls = []
+
+    async def status(**params):
+        assert asyncio.get_running_loop() is host
+        calls.append(params)
+        return {"ok": True}
+
+    exact = SimpleNamespace(
+        assistant_threads_setStatus=AsyncMock(side_effect=status),
+        agents_sessions_setStatus=AsyncMock(side_effect=status),
+    )
+    primary = SimpleNamespace(assistant_threads_setStatus=AsyncMock(), agents_sessions_setStatus=AsyncMock())
+    adapter = SlackAdapter(PlatformConfig(enabled=False))
+    adapter._app = SimpleNamespace(client=primary)
+    adapter._team_clients = {"T_B": exact, "T_A": primary}
+    monkeypatch.setattr(slack_adapter, "_AGENT_SESSIONS_SUPPORTED", modern)
+    monkeypatch.setattr(gateway.run, "_gateway_runner_ref", lambda: SimpleNamespace(_gateway_loop=host))
+    monkeypatch.setattr(ctx.platform_actions, "_capability_granted", lambda: True)
+    monkeypatch.setattr(ctx.platform_actions, "_resolve_adapter", lambda _platform: (adapter, None))
+    assert (await asyncio.to_thread(ctx.run_async, ctx.set_slack_thread_status("T_B", "D_B", "123.45", "Searching")))["ok"]
+    assert (await ctx.set_slack_thread_status("T_B", "D_B", "123.45", ""))["ok"]
+    assert not (await ctx.set_slack_thread_status("UNKNOWN", "D_B", "123.45", "Searching"))["ok"]
+    assert calls == [
+        {"channel_id": "D_B", "thread_ts": "123.45", "status": "Searching"},
+        {"channel_id": "D_B", "thread_ts": "123.45", "status": ""},
+    ]
+    assert (exact.agents_sessions_setStatus if modern else exact.assistant_threads_setStatus).await_count == 2
+    primary.assistant_threads_setStatus.assert_not_awaited()
+    primary.agents_sessions_setStatus.assert_not_awaited()

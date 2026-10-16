@@ -29,6 +29,12 @@ mapping for read-only methods: `conversations.history`, `conversations.replies`,
 It has the same profile, workspace and loop boundary. Both operations require the
 existing `gateway.platform_actions` capability; they do not bypass operator consent.
 
+`await ctx.set_slack_thread_status(workspace_id, channel_id, thread_ts, status)` sets
+or clears progress text with the same capability, profile, workspace and loop checks.
+An empty status clears it. The adapter retains its SDK compatibility for both the
+Assistant Threads and Agent Sessions status APIs. This mutation has a dedicated method
+so the source-read API remains read-only.
+
 Register a message shortcut with
 `ctx.register_slack_shortcut_handler(callback_id, callback)`. Its callback is
 `async def callback(ack, body, *, client)`. Acknowledge within Slack's deadline. `body`

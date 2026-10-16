@@ -2261,6 +2261,24 @@ class SlackAdapter(BasePlatformAdapter):
                 return await getattr(client_fn(), method)(**retry_kwargs)
             raise
 
+    async def set_plugin_thread_status(
+        self, workspace_id: str, channel_id: str, thread_ts: str, status: str,
+    ) -> bool:
+        """Set or clear status with the existing SDK-version compatibility and exact client."""
+        if self._outbound_blocked(channel_id, "plugin thread status for"):
+            return False
+        client = self._team_clients.get(workspace_id)
+        if client is None:
+            return False
+        try:
+            response = await _session_status_method(client)(
+                channel_id=channel_id, thread_ts=thread_ts, status=status,
+            )
+            return bool(response.get("ok", False))
+        except Exception:
+            logger.debug("[Slack] Plugin thread status unavailable")
+            return False
+
     async def send_plugin_message(
         self, chat_id: str, content: str, *, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,

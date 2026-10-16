@@ -475,6 +475,14 @@ class PluginContext:
         """Read Slack source messages through the exact workspace client on its host loop."""
         return await self.platform_actions.call_slack_api(workspace_id, method, **params)
 
+    async def set_slack_thread_status(
+        self, workspace_id: str, channel_id: str, thread_ts: str, status: str,
+    ) -> dict:
+        """Set a scoped assistant status; an empty status clears it."""
+        return await self.platform_actions.set_slack_thread_status(
+            workspace_id, channel_id, thread_ts, status,
+        )
+
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:
         <name>`` selects it. It receives a redacted ``ApprovalRequest`` and returns only a
