@@ -136,7 +136,7 @@ class MCPServerTransportMixin:
                 kwargs.update(handler.session_kwargs())
         if _core._MCP_NOTIFICATION_TYPES and _core._MCP_MESSAGE_HANDLER_SUPPORTED:
             kwargs["message_handler"] = self._make_message_handler()
-        if _core._MCP_LOGGING_CALLBACK_SUPPORTED:
+        if _core._MCP_LOGGING_CALLBACK_SUPPORTED and not self._isolated:
             kwargs["logging_callback"] = self._make_logging_callback()
         return kwargs
 
@@ -155,7 +155,7 @@ class MCPServerTransportMixin:
             except Exception as exc:
                 if isinstance(exc, asyncio.TimeoutError) or not should_fallback(exc):
                     raise
-                logger.info(log_fmt, self.name, exc, *log_extra)
+                self._logger.info(log_fmt, self.name, exc, *log_extra)
                 try:
                     return await call(fallback)
                 except Exception as fallback_exc:
@@ -165,7 +165,7 @@ class MCPServerTransportMixin:
                     if (isinstance(fallback_exc, asyncio.TimeoutError) or primary != "initialize"
                             or not _handshake_answered_with_unsupported_version(exc)):
                         raise
-                    logger.info("MCP server '%s': server/discover also failed (%s) — completing the handshake "
+                    self._logger.info("MCP server '%s': server/discover also failed (%s) — completing the handshake "
                                 "at %s, the version this client offered", self.name, fallback_exc,
                                 _core.LATEST_HANDSHAKE_VERSION)
                     return await asyncio.wait_for(self._complete_handshake_at_offered_version(session),
@@ -178,7 +178,7 @@ class MCPServerTransportMixin:
         if mode in ("legacy", "handshake"):
             return await call("initialize")
         if mode != "auto":
-            logger.warning("MCP server '%s': unknown protocol=%r — treating as 'auto' "
+            self._logger.warning("MCP server '%s': unknown protocol=%r — treating as 'auto' "
                            "(valid: auto, stateless, legacy)", self.name, mode)
         # mcp 1.x has no server/discover client — nothing to fall back to.
         return await attempt(
@@ -219,7 +219,8 @@ class MCPServerTransportMixin:
         await self._discover_tools()
         self._ready.set()
         self._ever_connected = True
-        _core._reset_server_error(self.name)
+        if not self._isolated:
+            _core._reset_server_error(self.name)
         # Session is live again: clear any breaker state from a prior outage so the first call after
         # recovery isn't gated on a stale consecutive-failure count (#16788).
         # A completed handshake alone is NOT proof of health: a flapping transport can handshake fine and
@@ -238,7 +239,7 @@ class MCPServerTransportMixin:
         self._session_proven = False
         reason = await self._wait_for_lifecycle_event()
         if label and reason == "reconnect":
-            logger.info("MCP server '%s': reconnect requested — tearing down %s session", self.name, label)
+            self._logger.info("MCP server '%s': reconnect requested — tearing down %s session", self.name, label)
         return reason
 
     async def _serve_transport(self, transport_cm, label: str, connect_timeout: float) -> str:
@@ -275,9 +276,12 @@ class MCPServerTransportMixin:
         for _pid in new_pids:
             try:
                 from hermes_cli.process_identity import register_child
-                register_child(_pid, "mcp-helper")
+                if self._isolated:
+                    register_child(_pid, "mcp-helper", record_argv=False)
+                else:
+                    register_child(_pid, "mcp-helper")
             except Exception:
-                logger.debug("spawn-ledger register_child failed for MCP helper pid %s", _pid, exc_info=True)
+                self._logger.debug("spawn-ledger register_child failed for MCP helper pid %s", _pid, exc_info=True)
         # Hand the pgroups to the shared parent-death supervisor so an ungraceful exit of this
         # process (kill -9, crash, force-quit) can't leave this server — or its descendants, e.g.
         # mcp-remote's spawned `node` — running forever. The graceful paths (shutdown,
@@ -308,7 +312,7 @@ class MCPServerTransportMixin:
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
         if config.get("identity_header") is not None:  # copy-pasted HTTP block: warn, don't mislead
-            logger.warning("MCP server '%s': identity_header is only supported on "
+            self._logger.warning("MCP server '%s': identity_header is only supported on "
                            "HTTP/SSE transports — ignored for stdio servers", self.name)
         if not _core._ensure_mcp_sdk():
             raise ImportError(f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
@@ -316,7 +320,9 @@ class MCPServerTransportMixin:
         command = config.get("command")
         if not command:
             raise ValueError(f"MCP server '{self.name}' has no 'command' in config")
-        command, safe_env = _config._resolve_stdio_command(command, _config._build_safe_env(config.get("env")))
+        safe_env = _config._build_safe_env(
+            config.get("env"), inherit_secret_sources=not self._isolated)
+        command, safe_env = _config._resolve_stdio_command(command, safe_env)
         # OSV malware preflight, then the cached-npx swap (ordering enforced there).
         command, args = await _core._preflight_stdio_command(self.name, command, config.get("args", []))
         # A stdio child inherits this process's cwd when none is configured. Hosted sessions (ACP,
@@ -343,9 +349,15 @@ class MCPServerTransportMixin:
         # otherwise stall the shared MCP event loop.
         new_pids: set = set()
         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
-        _config._write_stderr_log_header(self.name)
-        try:
+        owned_stderr = None
+        if self._stderr is not None:
+            errlog = self._stderr
+        elif self._isolated:
+            owned_stderr = errlog = open(os.devnull, "w", encoding="utf-8")
+        else:
+            _config._write_stderr_log_header(self.name)
             errlog = _config._get_mcp_stderr_log()
+        try:
             async with _core.stdio_client(server_params, errlog=errlog) as (read_stream, write_stream):
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
                 # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
@@ -359,6 +371,8 @@ class MCPServerTransportMixin:
                     connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
                     return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
         finally:  # clean exit, exceptions AND cancellation
+            if owned_stderr is not None:
+                owned_stderr.close()
             if new_pids:
                 self._release_spawned_children(new_pids)
 
@@ -394,7 +408,7 @@ class MCPServerTransportMixin:
             configured_header_names={key.lower() for key in probe_headers})
         try:
             async with _build_client(
-                    follow_redirects=True, timeout=_httpx.Timeout(timeout), transport=probe_transport,
+                    follow_redirects=self._follow_redirects, timeout=_httpx.Timeout(timeout), transport=probe_transport,
                     **_present(mounts=_mcp_proxy_mounts(_httpx, url, ssl_verify, client_cert, self.name))) as client:
                 resp = await client.head(url, headers=probe_headers)  # cheapest; GET on 405/501
                 if resp.status_code in (405, 501):
@@ -441,7 +455,7 @@ class MCPServerTransportMixin:
                 or eg.split(asyncio.CancelledError)[0] is not None
                 or not self._ready.is_set()):
             raise eg
-        logger.debug("MCP server '%s': transport TaskGroup exited after a live session "
+        self._logger.debug("MCP server '%s': transport TaskGroup exited after a live session "
                      "(%r) — reconnecting immediately instead of backing off", self.name, eg)
         return "reconnect"
 
@@ -454,7 +468,7 @@ class MCPServerTransportMixin:
             from tools.mcp_oauth_manager import get_manager
             return get_manager().get_or_build_provider(self.name, url, config.get("oauth"))
         except Exception as exc:
-            logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+            self._logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
             raise
 
     def _sse_transport(self, url: str, headers: dict, connect_timeout: float,
@@ -479,7 +493,7 @@ class MCPServerTransportMixin:
         def _sse_client_factory(headers=None, timeout=None, auth=None):
             inner_transport = _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
             return _httpx_mod.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=self._follow_redirects,
                 timeout=timeout if timeout is not None else _httpx_mod.Timeout(30.0, read=300.0),
                 transport=_make_mcp_body_cap_transport(_httpx_mod, inner_transport),
                 **_present(mounts=_mcp_proxy_mounts(_httpx_mod, url, ssl_verify, client_cert, self.name),
@@ -493,10 +507,10 @@ class MCPServerTransportMixin:
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
         if not _core._MCP_NEW_HTTP:
-            if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
+            if strict_cfg_headers or not self._follow_redirects:
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
-                                  "enforce the portable redirect-header boundary "
-                                  "(strict_redirect_headers). Upgrade the mcp package.")
+                                  "enforce caller-controlled redirects and the portable redirect-header "
+                                  "boundary. Upgrade the mcp package.")
             return _core.streamablehttp_client(url, headers=headers, timeout=float(connect_timeout), verify=ssl_verify,
                                                **_present(auth=oauth_auth))
         # Explicit AsyncClient matching the SDK's create_mcp_http_client defaults; MUST come from the
@@ -507,7 +521,7 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
-        client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
+        client_kwargs: dict = {"follow_redirects": self._follow_redirects, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
@@ -530,11 +544,11 @@ class MCPServerTransportMixin:
                               "Upgrade the mcp package to get HTTP support.")
         url = config["url"]
         headers = dict(config.get("headers") or {})
-        live = _live_endpoint(self.name)
+        live = None if self._isolated else _live_endpoint(self.name)
         if live is not None:
             url, live_headers = live
             headers.update(live_headers)
-        logger.debug("MCP server '%s': connecting to %s", self.name, url)
+        self._logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
         # Agent Plugins v1 strict_redirect_headers: configured headers MUST NOT follow a cross-origin
         # redirect — capture their names BEFORE client-generated headers are merged in.
@@ -552,7 +566,7 @@ class MCPServerTransportMixin:
         if self._sse_fallback:
             # A prior connect already proved this server SSE-only: skip the doomed Streamable
             # HTTP attempt on reconnects instead of flapping into the retry budget.
-            logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
+            self._logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
         transport = self._streamable_http_transport(*common, configured_header_names)
         label = "HTTP" if _core._MCP_NEW_HTTP else "legacy HTTP"
@@ -571,12 +585,12 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            if (self._isolated or self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc
                 raise
-            logger.warning(
+            self._logger.warning(
                 "MCP server '%s': Streamable HTTP rejected the initial connect (%s) — retrying "
                 "over SSE. If this connects, set `transport: sse` for this server in config.yaml "
                 "to skip the failed attempt on future startups.",
@@ -609,7 +623,7 @@ class MCPServerTransportMixin:
         if self.session is None:
             return
         if not self._advertises_tools():
-            logger.info("MCP server '%s': does not advertise 'tools' capability — "
+            self._logger.info("MCP server '%s': does not advertise 'tools' capability — "
                         "skipping tools/list (prompts/resources remain available)", self.name)
             self._tools = []
         else:
@@ -624,7 +638,7 @@ class MCPServerTransportMixin:
         ``_discover_and_register_server``). Outage handling may clear ``_ready`` and deregister stale tools;
         ownership via ``_servers`` authorizes publishing before readiness is restored so a revival (or a server
         retained after a recoverable initial failure) never comes back with zero tools."""
-        if self._registered_tool_names:
+        if self._isolated or self._registered_tool_names:
             return
         with _core._lock:
             owned = [key for key, live in _core._servers.items() if live is self]

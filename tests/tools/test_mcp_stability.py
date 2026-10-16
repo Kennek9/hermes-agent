@@ -124,8 +124,7 @@ class TestStdioPidTracking:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
 
-        server = MCPServerTask.__new__(MCPServerTask)
-        server.name = "test-zombie-reap"
+        server = MCPServerTask("test-zombie-reap")
         server._ready = MagicMock()
         server._shutdown_event = MagicMock()
         server._shutdown_event.is_set.return_value = True

@@ -64,7 +64,7 @@ class MCPServerHealthMixin:
             try:
                 await self._refresh_tools()
             except Exception:
-                logger.exception("MCP server '%s': dynamic tool refresh failed", self.name)
+                self._logger.exception("MCP server '%s': dynamic tool refresh failed", self.name)
         task = asyncio.create_task(_run())
         self._pending_refresh_tasks.add(task)
         task.add_done_callback(self._pending_refresh_tasks.discard)
@@ -91,9 +91,9 @@ class MCPServerHealthMixin:
                     data = data[:2000] + "... [truncated]"
                 logger_name = getattr(params, "logger", None)
                 origin = f"{self.name}/{logger_name}" if logger_name else self.name
-                logger.log(level, "MCP server log [%s]: %s", origin, data)
+                self._logger.log(level, "MCP server log [%s]: %s", origin, data)
             except Exception:
-                logger.debug("Failed to handle MCP log notification from '%s'", self.name, exc_info=True)
+                self._logger.debug("Failed to handle MCP log notification from '%s'", self.name, exc_info=True)
         return _on_log
 
     def _make_message_handler(self):
@@ -101,7 +101,7 @@ class MCPServerHealthMixin:
         async def _handler(message):
             try:
                 if isinstance(message, Exception):
-                    logger.debug("MCP message handler (%s): exception: %s", self.name, message)
+                    self._logger.debug("MCP message handler (%s): exception: %s", self.name, message)
                     return
                 if not (_core._MCP_NOTIFICATION_TYPES and isinstance(message, _core.ServerNotification)):
                     return
@@ -109,17 +109,17 @@ class MCPServerHealthMixin:
                 # a RootModel (payload under ``.root``); without this unwrap refreshes silently stop.
                 payload = getattr(message, "root", message)
                 if isinstance(payload, _core.ToolListChangedNotification):
-                    logger.info("MCP server '%s': received tools/list_changed notification", self.name)
+                    self._logger.info("MCP server '%s': received tools/list_changed notification", self.name)
                     # Separate task: refreshing synchronously inside the handler can wedge the stdio
                     # JSON-RPC stream when list_changed arrives while another request is in flight.
                     self._schedule_tools_refresh()
                     await asyncio.sleep(0)  # one tick so short-lived contexts (and tests) observe it
                 elif isinstance(payload, _core.PromptListChangedNotification):
-                    logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
+                    self._logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
                 elif isinstance(payload, _core.ResourceListChangedNotification):
-                    logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
+                    self._logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
             except Exception:
-                logger.exception("Error in MCP message handler for '%s'", self.name)
+                self._logger.exception("Error in MCP message handler for '%s'", self.name)
         return _handler
 
     def _deregister_owned(self, tool_names: Iterable[str]) -> None:
@@ -144,9 +144,12 @@ class MCPServerHealthMixin:
                 # and the next tools/list_changed re-arms this refresh against the live session.
                 session = self.session
                 if session is None:
-                    logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
+                    self._logger.debug("MCP server '%s': skipping dynamic tool refresh; session not connected", self.name)
                     return
                 new_mcp_tools = await _core._paginate_full_list(session.list_tools, "tools", self.name)
+            if self._isolated:
+                self._tools = new_mcp_tools
+                return
             # Remove only stale names first — no nuke-and-repave: live turns may hold tool-call
             # IDs pointing at existing handlers; in-place replacement avoids "not connected" races.
             self._deregister_owned(old_tool_names - {mcp_prefixed_tool_name(self.name, tool.name) for tool in new_mcp_tools})
@@ -160,10 +163,10 @@ class MCPServerHealthMixin:
             changes = [f"{label}: {', '.join(sorted(names))}" for label, names in
                        (("added", new_tool_names - old_tool_names), ("removed", old_tool_names - new_tool_names)) if names]
             if changes:
-                logger.warning("MCP server '%s': tools changed dynamically — %s. "
+                self._logger.warning("MCP server '%s': tools changed dynamically — %s. "
                                "Verify these changes are expected.", self.name, "; ".join(changes))
             else:
-                logger.info("MCP server '%s': dynamically refreshed %d tool(s) (no changes)",
+                self._logger.info("MCP server '%s': dynamically refreshed %d tool(s) (no changes)",
                             self.name, len(self._registered_tool_names))
 
     async def _keepalive_probe(self) -> None:
@@ -181,7 +184,7 @@ class MCPServerHealthMixin:
                     if not self._advertises_tools():  # ping definitively unsupported, nothing to fall back to
                         raise
                     self._ping_unsupported = True
-                    logger.info("MCP server '%s': does not implement the optional 'ping' utility (-32601); "
+                    self._logger.info("MCP server '%s': does not implement the optional 'ping' utility (-32601); "
                                 "using 'list_tools' for keepalive on this connection.", self.name)
                 elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)) and self._advertises_tools():
                     # A server that silently drops ping looks like a dead transport: confirm with
@@ -191,7 +194,7 @@ class MCPServerHealthMixin:
                     except Exception:
                         raise exc from None
                     self._ping_unsupported = True  # latch so later keepalives skip the 30s wait
-                    logger.info("MCP server '%s': ping timed out but list_tools succeeded — server "
+                    self._logger.info("MCP server '%s': ping timed out but list_tools succeeded — server "
                                 "silently drops ping; using 'list_tools' for keepalive on this connection.", self.name)
                     return
                 else:
@@ -214,7 +217,7 @@ class MCPServerHealthMixin:
         self._park_reason = None
         if self._was_parked:
             self._was_parked = False
-            logger.warning("MCP server '%s': revived — session healthy again after "
+            self._logger.warning("MCP server '%s': revived — session healthy again after "
                            "parking (state: parked → connected)", self.name)
         # A proven fresh transport clears the one-time permanent-failure grace and any race bookkeeping.
         self._permanent_grace_used = self._teardown_race = False
@@ -226,7 +229,7 @@ class MCPServerHealthMixin:
         instead of the connection silently staying poisoned until process restart (#81051/#77765/#84132).
         """
         if self._suspect_reason is None and reason:
-            logger.warning("MCP server '%s': connection marked suspect (%s); next call will health-check it",
+            self._logger.warning("MCP server '%s': connection marked suspect (%s); next call will health-check it",
                            self.name, reason)
         self._suspect_reason = reason or None
 
@@ -245,7 +248,7 @@ class MCPServerHealthMixin:
             await asyncio.wait_for(self._keepalive_probe(), timeout=timeout)
         except Exception as exc:
             root = _unwrap_exception_group(exc)
-            logger.warning("MCP server '%s': suspect connection (%s) failed health check (%s: %s) — "
+            self._logger.warning("MCP server '%s': suspect connection (%s) failed health check (%s: %s) — "
                            "requesting reconnect (state: suspect → degraded)",
                            self.name, reason, type(root).__name__, root)
             self._suspect_reason = None
@@ -254,7 +257,7 @@ class MCPServerHealthMixin:
             self._ready.clear()
             self._reconnect_event.set()
             return False
-        logger.info("MCP server '%s': suspect connection passed health check (%s) — clearing suspicion",
+        self._logger.info("MCP server '%s': suspect connection passed health check (%s) — clearing suspicion",
                     self.name, reason)
         self._suspect_reason = None
         self._mark_session_proven()

@@ -119,7 +119,7 @@ class MCPServerRunMixin:
                             # would spin on zero-timeout waits forever (#115483). No mark_suspect:
                             # the reconnect rebuilds the transport and the new child's handshake is
                             # the health check.
-                            logger.warning("MCP server '%s' stdio child exited before the session proved "
+                            self._logger.warning("MCP server '%s' stdio child exited before the session proved "
                                            "healthy; triggering reconnect (state: connected → degraded)",
                                            self.name)
                             break
@@ -136,7 +136,7 @@ class MCPServerRunMixin:
                             await self._keepalive_probe()
                     except Exception as exc:
                         root = _errors._unwrap_exception_group(exc)
-                        logger.warning("MCP server '%s' keepalive failed, triggering reconnect (state: connected → "
+                        self._logger.warning("MCP server '%s' keepalive failed, triggering reconnect (state: connected → "
                                        "degraded): %s: %s", self.name, type(root).__name__, root)
                         self.mark_suspect(f"keepalive failed: {type(root).__name__}: {root}")
                         self._reconnect_event.set()
@@ -180,10 +180,10 @@ class MCPServerRunMixin:
         information and warns again."""
         line = msg % args if args else msg
         if self._was_parked and line == self._last_park_line:
-            logger.debug(msg, *args)
+            self._logger.debug(msg, *args)
         else:
             self._last_park_line = line
-            logger.warning(msg, *args)
+            self._logger.warning(msg, *args)
 
     async def _park(self, revival_reason: str) -> bool:
         """Drop this server's tools and wait for a reconnect request; True when shutdown came instead.
@@ -217,7 +217,7 @@ class MCPServerRunMixin:
             # config gate; only the unattended probe honours it. Announce the pause once:
             # a line per skipped wake would be the very flood this gate exists to stop.
             if outcome == "self-probe" and not self._still_configured_enabled():
-                (logger.debug if paused else logger.info)(
+                (self._logger.debug if paused else self._logger.info)(
                     "MCP server '%s': parked entry is disabled or gone from mcp_servers; pausing the "
                     "self-probe until it is re-enabled", self.name)
                 paused = True
@@ -231,7 +231,7 @@ class MCPServerRunMixin:
                 from tools.mcp_oauth import _oauth_interactive_enabled
 
                 _oauth_interactive_enabled.set(False)
-            logger.debug(
+            self._logger.debug(
                 "MCP server '%s': attempting revival %s (%s); rebuilding transport.",
                 self.name,
                 revival_reason,
@@ -244,6 +244,8 @@ class MCPServerRunMixin:
         and ``enabled`` not false. Config read is cached on the file signature, so a parked
         task polling this every ``_PARKED_RETRY_INTERVAL`` stays cheap. Fail-open on a
         config-read error: a broken config must not wedge a healthy server's revival."""
+        if self._isolated:
+            return not self._shutdown_event.is_set()
         try:
             from tools import mcp_tool_config as _config
             entry = (_config._load_mcp_config() or {}).get(self.name)
@@ -259,23 +261,24 @@ class MCPServerRunMixin:
         must not start (bad remote URL / non-MCP endpoint: fail fast with ``_error`` set and
         ``_ready`` fired instead of burning the reconnect ladder inside the SDK's httpx layer)."""
         self._config = config
-        self.tool_timeout = _resolve_tool_timeout(config)
+        self.tool_timeout = (config.get("timeout", config.get("tool_timeout", _core._DEFAULT_TOOL_TIMEOUT))
+                             if self._isolated else _resolve_tool_timeout(config))
         self._auth_type = (config.get("auth") or "").lower().strip()
         self._idle_timeout_seconds = _get_lifecycle_seconds(config, "idle_timeout_seconds")
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
         # The _MCP_*_TYPES flags are False until the lazy SDK import runs.
         _core._ensure_mcp_sdk()
-        sampling_config = config.get("sampling", {})
+        sampling_config = {"enabled": False} if self._isolated else config.get("sampling", {})
         self._sampling = (_sampling.SamplingHandler(self.name, sampling_config)
                           if sampling_config.get("enabled", True) and _core._MCP_SAMPLING_TYPES else None)
         # elicitation/create lets a server ask for structured input mid-call; the handler
         # routes it through Hermes' approval system.
-        elicitation_config = config.get("elicitation", {})
+        elicitation_config = {"enabled": False} if self._isolated else config.get("elicitation", {})
         self._elicitation = (_sampling.ElicitationHandler(self.name, elicitation_config,
                                                        call_context=lambda: self._pending_call_context)
                              if elicitation_config.get("enabled", True) and _core._MCP_ELICITATION_TYPES else None)
         if "url" in config and "command" in config:
-            logger.warning("MCP server '%s' has both 'url' and 'command' in config. Using HTTP transport "
+            self._logger.warning("MCP server '%s' has both 'url' and 'command' in config. Using HTTP transport "
                            "('url'). Remove 'command' to silence this warning.", self.name)
         if not self._is_http():
             return True
@@ -294,7 +297,7 @@ class MCPServerRunMixin:
                     client_cert=_errors._resolve_client_cert(self.name, config),
                     strict_redirect_headers=bool(config.get("strict_redirect_headers")))
         except (_errors.InvalidMcpUrlError, _errors.NonMcpEndpointError) as exc:
-            logger.warning("%s", exc)
+            self._logger.warning("%s", exc)
             self._publish_error(exc)  # fail fast and non-retryably
             return False
         return True
@@ -312,14 +315,14 @@ class MCPServerRunMixin:
         was started with, so a ``url`` edited while the process runs (dashboard/Desktop re-auth, a
         catalog migration) left the loop probing the OLD URL — and that stale-URL provider evicted the
         fresh one the dashboard had just authorised for the new URL, dropping its tokens/DCR client."""
-        if not self._is_http():
+        if self._isolated or not self._is_http():
             return config
         from tools import mcp_tool_config as _config
         fresh = (_config._load_mcp_config() or {}).get(self.name)
         if not isinstance(fresh, dict) or "url" not in fresh or all(
                 fresh.get(k) == config.get(k) for k in self._REMOTE_REBIND_KEYS):
             return config
-        logger.info("MCP server '%s': definition changed in config.yaml (%s -> %s); rebuilding with the new one",
+        self._logger.info("MCP server '%s': definition changed in config.yaml (%s -> %s); rebuilding with the new one",
                     self.name, config.get("url"), fresh.get("url"))
         self._config = fresh
         self._auth_type = (fresh.get("auth") or "").lower().strip()
@@ -368,13 +371,13 @@ class MCPServerRunMixin:
         if self._shutdown_event.is_set():
             return False
         if lifecycle_reason == "recycle":
-            logger.info("MCP server '%s': stdio session recycled after %s; waiting for lazy reconnect",
+            self._logger.info("MCP server '%s': stdio session recycled after %s; waiting for lazy reconnect",
                         self.name, self._recycled_reason)
             self.session = None
             # Dormant until a lazy call wakes it (untimed: nothing to self-probe).
             return await self._wait_for_reconnect_or_shutdown() != "shutdown"
         # Per-cycle chatter stays DEBUG; WARNINGs mark state transitions.
-        logger.debug("MCP server '%s': reconnecting (OAuth recovery or manual refresh)", self.name)
+        self._logger.debug("MCP server '%s': reconnecting (OAuth recovery or manual refresh)", self.name)
         # A clean return is NOT proof of health (a flapper handshakes fine, then drops). Only a
         # PROVEN session clears the budget; a teardown race is recovery, never a park charge.
         # A clean transport return means a session was established and then asked to rebuild (auth recovery
@@ -384,7 +387,7 @@ class MCPServerRunMixin:
         # consecutive-failure budget once the session PROVED healthy — survived >=1 full keepalive interval
         # or served >=1 successful tool call (_mark_session_proven).
         if self._teardown_race and not self._session_proven:
-            logger.info("MCP server '%s': reconnect after teardown race (in-flight calls were failed); "
+            self._logger.info("MCP server '%s': reconnect after teardown race (in-flight calls were failed); "
                         "not charging the rapid-drop budget", self.name)
             self._teardown_race, budget.backoff = False, 1.0
         elif self._session_proven:
@@ -432,7 +435,7 @@ class MCPServerRunMixin:
         root = _errors._unwrap_exception_group(exc)
         failure_class = _errors._classify_mcp_failure(root)
         if self._is_recycled_stdio():
-            logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed, marking unavailable "
+            self._logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed, marking unavailable "
                            "while retrying: %s: %s", self.name, type(root).__name__, root)
             self._recycled_reason = None
         # Initial-connect ladder (a startup blip must not kill the server); gated on
@@ -446,7 +449,7 @@ class MCPServerRunMixin:
         if not self._ever_connected:
             return await self._on_initial_connect_error(exc, root, failure_class, budget)
         if self._shutdown_event.is_set():
-            logger.debug("MCP server '%s' disconnected during shutdown: %s: %s",
+            self._logger.debug("MCP server '%s' disconnected during shutdown: %s: %s",
                          self.name, type(root).__name__, root)
             return False
         if failure_class == "permanent":
@@ -458,7 +461,7 @@ class MCPServerRunMixin:
                 "until it recovers (state: degraded → parked): %s: %s",
                 self.name, _core._MAX_RECONNECT_RETRIES, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
             return await self._park_and_rearm("from parked state", budget)
-        logger.debug("MCP server '%s' connection lost (attempt %d/%d), reconnecting in %.0fs: %s: %s",
+        self._logger.debug("MCP server '%s' connection lost (attempt %d/%d), reconnecting in %.0fs: %s: %s",
                      self.name, self._reconnect_retries, _core._MAX_RECONNECT_RETRIES, budget.backoff,
                      type(root).__name__, root)
         await self._backoff_sleep(budget)
@@ -482,7 +485,7 @@ class MCPServerRunMixin:
                 "requested (state: connecting → parked): %s: %s",
                 self.name, _core._MAX_INITIAL_CONNECT_RETRIES, type(root).__name__, root)
             return await self._park_initial_failure(exc, "after initial connection failures", budget)
-        logger.debug(
+        self._logger.debug(
             "MCP server '%s' initial connection failed (attempt %d/%d), retrying in %.0fs: %s: %s",
             self.name, budget.initial_retries, _core._MAX_INITIAL_CONNECT_RETRIES, budget.backoff,
             type(root).__name__, root)
@@ -497,7 +500,7 @@ class MCPServerRunMixin:
         if _errors._is_auth_error(root) and self._session_proven and not self._permanent_grace_used:
             self._permanent_grace_used = True
             self.mark_suspect(f"auth error on proven session: {root}")
-            logger.warning(
+            self._logger.warning(
                 "MCP server '%s': auth error on a previously healthy session — marking suspect and forcing "
                 "one reconnect instead of parking (state: connected → suspect): %s: %s",
                 self.name, type(root).__name__, root)
@@ -534,8 +537,14 @@ class MCPServerRunMixin:
         if self._task and not self._task.done():
             try:
                 await asyncio.wait_for(self._task, timeout=10)
+            except asyncio.CancelledError:
+                # start() cancels the owned task when its caller times out. That
+                # completed cancellation is cleanup, while cancellation of this
+                # shutdown caller must still propagate.
+                if asyncio.current_task().cancelling():
+                    raise
             except asyncio.TimeoutError:
-                logger.warning("MCP server '%s' shutdown timed out, cancelling task", self.name)
+                self._logger.warning("MCP server '%s' shutdown timed out, cancelling task", self.name)
                 self._task.cancel()
                 try:
                     await self._task

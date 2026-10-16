@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -144,6 +145,30 @@ def test_register_self_survives_non_utf8_argv(tmp_path):
         assert pi.register_self("serve", project_root=Path("/x/install")) is True
     me = next(e for e in json.loads(ledger.read_text(encoding="utf-8")) if e["pid"] == 999)
     assert me["argv"] == " ".join(bad_argv)
+
+
+@pytest.mark.parametrize("private", [False, True])
+def test_register_child_can_omit_argv_without_losing_process_identity(tmp_path, monkeypatch, private):
+    import psutil
+
+    ledger = tmp_path / "spawn-ledger.json"
+    monkeypatch.setattr(pi, "_ledger_path", lambda: ledger)
+    argument = "personal-launch-value-68c112"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", argument])
+    try:
+        options = {"record_argv": False} if private else {}
+        assert pi.register_child(child.pid, "mcp-helper", **options)
+        entry = next(item for item in json.loads(ledger.read_text()) if item["pid"] == child.pid)
+        assert entry["create_time"] == pytest.approx(psutil.Process(child.pid).create_time())
+        assert entry["spawner_pid"] == os.getpid()
+        assert entry["purpose"] == "mcp-helper"
+        if private:
+            assert entry["argv"] == ""
+        else:
+            assert argument in entry["argv"]
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")

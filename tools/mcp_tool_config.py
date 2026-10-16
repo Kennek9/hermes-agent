@@ -108,10 +108,11 @@ _CONTEXT_VAR_RESOLVERS = {
     "workspaceFolderBasename": _workspace_basename, "pathSeparator": lambda: os.sep, "/": lambda: os.sep}
 
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(user_env: Optional[dict], *, inherit_secret_sources: bool = True) -> dict:
     """Filtered env for stdio subprocesses so API keys/tokens don't leak: the safe baseline
     keys, ``XDG_*``, vars injected by an external secret source (users configured that backend
-    precisely so subprocesses can consume them), plus the server config's own ``env``."""
+    precisely so subprocesses can consume them), plus the server config's own ``env``.
+    Isolated connections disable source inheritance and receive only explicit secrets."""
     from agent.secret_scope import get_secret
     from hermes_cli.env_loader import secret_source_names
     env = {
@@ -120,7 +121,7 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     # Source-tagged names are process-wide (any profile's hydration tags them) while os.environ
     # holds only the LAUNCH profile's values, so the value must come from the active profile's
     # secret scope; a profile that lacks the name gets nothing, never another profile's token.
-    for key in secret_source_names():
+    for key in secret_source_names() if inherit_secret_sources else ():
         value = get_secret(key)
         if value is not None:
             env[key] = value

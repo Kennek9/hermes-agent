@@ -317,10 +317,21 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_recycled_reason", "initialize_result", "_ping_unsupported", "_list_cache_meta",
         "_reconnect_retries", "_session_proven", "_was_parked", "_inflight_tasks", "_reconnecting",
         "_suspect_reason", "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line")
+        "_ever_connected", "_sse_fallback", "_park_reason", "_last_park_line",
+        "_isolated", "_stderr", "_follow_redirects", "_logger")
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, *, isolated: bool = False, stderr: Optional[Any] = None,
+                 follow_redirects: bool = True):
         self.name = name
+        self._isolated = isolated
+        self._stderr = stderr
+        self._follow_redirects = follow_redirects
+        # Personal-server diagnostics can contain credentials and private tool data.
+        # A private Logger avoids changing logging for other connections in this process.
+        self._logger = logging.Logger("tools.mcp_isolated.transport") if isolated else logger
+        if isolated:
+            self._logger.addHandler(logging.NullHandler())
+            self._logger.propagate = False
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
