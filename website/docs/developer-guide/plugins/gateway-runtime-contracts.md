@@ -10,6 +10,15 @@ the gateway's task-local ContextVars. Unknown, unbound or cleared values never i
 `HERMES_SESSION_*` process environment values. Keep actor and routing data out of tool
 parameters supplied by a model.
 
+Tool handlers may declare optional `task_id`, `session_id`, `turn_id`, `tool_call_id`
+and `api_request_id` keyword parameters. These execution identifiers come from the
+host call, separately from model arguments, and do not add fields to the model's tool
+schema. Missing identifiers remain `None`; handlers with a narrow signature keep
+working. Correlate durable turn state with the exact nonempty host session and turn
+identifiers, never with a most-recent-turn fallback. The compression `context_handoff`
+hook also receives the host's current `turn_id` alongside its existing session,
+parent-session and sender fields.
+
 `ctx.run_async(awaitable)` uses the host's synchronous-to-async bridge and carries the
 calling profile and request context. `ctx.spawn_task(coroutine, name=None)` supervises
 background work on the profile's host loop and cancels it when the plugin unloads. A

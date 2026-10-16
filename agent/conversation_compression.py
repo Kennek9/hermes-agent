@@ -2985,6 +2985,7 @@ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required
         for _handoff in _handoff_hook(
             "context_handoff",
             session_id=agent.session_id,
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
             parent_session_id=getattr(agent, "_parent_session_id", None),
             sender_id=getattr(agent, "_user_id", None),
         ):
