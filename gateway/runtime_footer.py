@@ -16,6 +16,20 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_CONTEXT_RESET_NOTICE = (
+    "⚠️ This conversation has a lot of context and may feel slow. "
+    "Send /reset to start fresh."
+)
+
+
+def context_needs_reset_notice(
+    context_tokens: int, context_length: Optional[int]
+) -> bool:
+    return context_tokens >= 100_000 or bool(
+        context_length
+        and context_length > 0
+        and context_tokens / context_length >= 0.75
+    )
 
 
 def _home_relative_cwd(cwd: str) -> str:
@@ -106,15 +120,20 @@ def format_runtime_footer(*, model: Optional[str], context_tokens: int,
 def build_footer_line(*, user_config: dict[str, Any] | None, platform_key: str | None,
                       model: Optional[str], context_tokens: int, context_length: Optional[int],
                       cwd: Optional[str] = None, turn_seconds: Optional[float] = None,
-                      requested_model: Optional[str] = None, served_model: Optional[str] = None) -> str:
+                      requested_model: Optional[str] = None, served_model: Optional[str] = None,
+                      include_context_notice: bool = True) -> str:
     """Entry point for gateway/run.py: footer text, or "" when disabled / no data. Callers append it
     to the final response themselves, preserving a single blank line of separation.
     ``turn_seconds`` is the caller-measured (``time.monotonic()``) run duration; ``None`` skips the
     ``latency`` field."""
     cfg = resolve_footer_config(user_config, platform_key)
-    if not cfg.get("enabled"):
-        return ""
-    return format_runtime_footer(model=model, context_tokens=context_tokens,
-                                 context_length=context_length, cwd=cwd, turn_seconds=turn_seconds,
-                                 requested_model=requested_model, served_model=served_model,
-                                 fields=cfg.get("fields") or _DEFAULT_FIELDS)
+    footer = ""
+    if cfg.get("enabled"):
+        footer = format_runtime_footer(
+            model=model, context_tokens=context_tokens, context_length=context_length,
+            cwd=cwd, turn_seconds=turn_seconds, requested_model=requested_model,
+            served_model=served_model, fields=cfg.get("fields") or _DEFAULT_FIELDS,
+        )
+    if include_context_notice and context_needs_reset_notice(context_tokens, context_length):
+        return f"{footer}\n{_CONTEXT_RESET_NOTICE}" if footer else _CONTEXT_RESET_NOTICE
+    return footer

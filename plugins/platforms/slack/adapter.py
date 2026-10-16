@@ -1,6 +1,8 @@
 """Slack platform adapter: slack-bolt Socket Mode (messages, slash commands, threads)."""
 
 import asyncio
+import hashlib
+from datetime import datetime, timezone
 import contextvars
 import functools
 import inspect
@@ -1646,6 +1648,7 @@ class SlackAdapter(BasePlatformAdapter):
         # without per-message WARNING noise.
         @self._app.event(re.compile(r".*"))
         async def handle_unhandled_event(event, body, logger):
+            await self._dispatch_plugin_slack_event(event, body)
             logger.debug(
                 "[Slack] Ignoring unhandled event type=%s (no listener registered; subscribed "
                 "events not handled by Hermes can be removed from the Slack app manifest via "
@@ -1708,7 +1711,7 @@ class SlackAdapter(BasePlatformAdapter):
         def _make_wrapper(cb, plugin_name):
             async def _wrapped(ack, body, action):
                 try:
-                    await cb(ack, body, action)
+                    await self._invoke_plugin_action_callback(cb, ack, body, action)
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.error(
                         "[Slack] Plugin '%s' action handler raised: %s", plugin_name, exc,
@@ -3687,8 +3690,49 @@ class SlackAdapter(BasePlatformAdapter):
             "context_channel_id": self._context_channel_id(context),
             "user_id": _str_or_empty(user_id), "team_id": _str_or_empty(team_id)}
 
+    async def _invoke_plugin_action_callback(self, callback, ack, body, action):
+        """Preserve legacy positional actions; inject only the exact workspace client."""
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        kwargs = {}
+        if "client" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            client = self._team_clients.get(self._event_team_id(body))
+            if client is None:
+                await ack()
+                return
+            kwargs["client"] = client
+        result = callback(ack, body, action, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _dispatch_plugin_slack_event(self, event, body=None):
+        """Do not borrow a primary client for an unknown or contradictory workspace."""
+        from hermes_cli.plugins import get_plugin_manager
+
+        body = body or {}
+        team = self._event_team_id(event, body)
+        outer = self._event_team_id(body)
+        client = self._team_clients.get(team)
+        if not team or (outer and outer != team) or client is None:
+            return
+        manager = get_plugin_manager()
+        for event_type, callback, owner in manager.get_slack_event_handlers():
+            if event_type != event.get("type"):
+                continue
+            try:
+                fields = {"event": event, "body": body, "client": client}
+                result = callback(**manager._hook_callback_kwargs(callback, fields))
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("[Slack] plugin event observer failed: %s", owner)
+
     async def _handle_app_home_opened(self, event: dict, body: Optional[dict] = None) -> None:
         """Handle Slack Agent DM-open lifecycle events without producing replies."""
+        if event.get("tab") in {"home", "messages"}:
+            await self._dispatch_plugin_slack_event(event, body)
         if event.get("tab") != "messages":
             return
         channel_id = event.get("channel") or event.get("channel_id") or ""
@@ -4298,6 +4342,127 @@ class SlackAdapter(BasePlatformAdapter):
         self._reacting_message_ids.add(self._workspace_message_marker(team_id, ts))
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
 
+    async def _emit_message_created_event(self, event: dict, payload: Optional[dict] = None) -> None:
+        """Observe authorized human messages independently of whether they wake a chat."""
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None or event.get("subtype") or event.get("_slack_changed_event_ts"):
+            return
+        if self._event_declares_bot_sender(event):
+            return
+        team = self._event_team_id(event, payload)
+        outer_team = self._event_team_id(payload or {})
+        channel, user, message = (event.get(k) for k in ("channel", "user", "ts"))
+        if (not team or not outer_team or team != outer_team
+                or not all(isinstance(x, str) and x for x in (channel, user, message))
+                or not isinstance(event.get("text"), str)
+                or not re.fullmatch(r"\d{1,12}\.\d{1,6}", message)
+                or user == self._team_bot_user_ids.get(team)):
+            return
+        channel_type = event.get("channel_type")
+        if channel_type == "im" or (channel_type is None and channel.startswith("D")):
+            chat_type = "dm"
+        elif channel_type in {"channel", "group", "mpim"} or (channel_type is None and channel.startswith(("C", "G"))):
+            chat_type = "group"
+        else:
+            return
+        try:
+            seconds, micros = message.split(".")
+            occurred = datetime.fromtimestamp(int(seconds), timezone.utc).replace(microsecond=int(micros.ljust(6, "0"))).isoformat()
+            event_id = hashlib.sha256(json.dumps([team, channel, "created", message, occurred], separators=(",", ":")).encode()).hexdigest()
+            source = self.build_source(chat_id=channel, chat_type=chat_type, user_id=user, scope_id=team, message_id=message)
+            await handler({"platform":"slack", "event_type":"message_received", "payload":{
+                "workspace_id":team,"user_id":user,"channel_id":channel,"chat_type":chat_type,
+                "message_id":message,"thread_root_ts":event.get("thread_ts") or message,"event_id":event_id,"occurred_at":occurred,
+                "event_kind":"created","content":event["text"],"source_url":"",
+            }}, source)
+        except Exception:
+            logger.warning("[Slack] message source observer failed")
+
+    async def _emit_message_lifecycle_event(
+        self, event: dict, payload: Optional[dict] = None
+    ) -> None:
+        """Observe SDK-authenticated edits/deletes before chat dedup/admission.
+
+        The gateway callback owns user authorization. Plugins must additionally
+        validate stored source ownership and workspace membership. No callback
+        means no observation; never invoke business plugins directly here.
+        """
+        kind = event.get("subtype")
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None or kind not in {"message_changed", "message_deleted"}:
+            return
+        message = event.get("message" if kind == "message_changed" else "previous_message")
+        if not isinstance(message, dict) or self._event_declares_bot_sender(message):
+            return
+        workspace = self._event_team_id(event, payload)
+        outer_workspace = self._event_team_id(payload or {})
+        channel = event.get("channel")
+        previous = event.get("previous_message")
+        if not isinstance(previous, dict):
+            logger.debug("[Slack] lifecycle rejected: previous_message_missing")
+            return
+        author = previous.get("user")
+        message_id = message.get("ts")
+        if (not workspace or not outer_workspace or workspace != outer_workspace
+                or not isinstance(channel, str) or not isinstance(author, str)
+                or not isinstance(message_id, str) or self._is_ignored_channel(channel)):
+            return
+        if (not author or not re.fullmatch(r"\d{1,12}\.\d{1,6}", message_id)
+                or any(item.get(key) and item[key] != workspace
+                       for item in (previous, message) for key in ("team", "team_id"))):
+            return
+        if kind == "message_deleted" and event.get("deleted_ts") != message_id:
+            return
+        if (previous.get("ts") != message_id
+                or (message.get("user") and message["user"] != author)
+                or (previous.get("channel") and previous["channel"] != channel)
+                or (message.get("channel") and message["channel"] != channel)):
+            return
+        edited = message.get("edited") or {}
+        if not isinstance(edited, dict):
+            return
+        # Source author is provenance, never an approval actor or claimed deleter.
+        timestamp = (edited.get("ts") or event.get("event_ts")) if kind == "message_changed" else event.get("event_ts")
+        if not isinstance(timestamp, str) or not re.fullmatch(r"\d{1,12}\.\d{1,6}", timestamp):
+            return
+        try:
+            seconds, micros = timestamp.split(".")
+            occurred = datetime.fromtimestamp(int(seconds), timezone.utc).replace(
+                microsecond=int(micros.ljust(6, "0"))
+            ).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return
+        channel_type = event.get("channel_type")
+        if channel_type == "im" or (channel_type is None and channel.startswith("D")):
+            chat_type = "dm"
+        elif channel_type in {"channel", "group", "mpim"} or (channel_type is None and channel.startswith(("C", "G"))):
+            chat_type = "group"
+        else:
+            return
+        content = message.get("text", "") if kind == "message_changed" else ""
+        if not isinstance(content, str):
+            return
+        event_kind = "edited" if kind == "message_changed" else "deleted"
+        event_id = (payload or {}).get("event_id") or hashlib.sha256(
+            json.dumps([workspace, channel, event_kind, message_id, occurred], separators=(",", ":")).encode()
+        ).hexdigest()
+        if not isinstance(event_id, str):
+            return
+        source = self.build_source(chat_id=channel, chat_type=chat_type, user_id=author,
+                                   scope_id=workspace, message_id=message_id)
+        normalized = {"platform": "slack", "event_type": kind, "payload": {
+            "workspace_id": workspace, "user_id": author, "channel_id": channel,
+            "chat_type": chat_type, "message_id": message_id, "thread_root_ts": message.get("thread_ts") or previous.get("thread_ts") or message_id, "event_id": event_id,
+            "occurred_at": occurred, "event_kind": event_kind,
+        }}
+        if kind == "message_changed":
+            normalized["payload"]["content"] = content
+        try:
+            await handler(normalized, source)
+        except Exception:
+            logger.warning("[Slack] message lifecycle observer failed")
+
+
     async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
         """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
         turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
@@ -4361,7 +4526,14 @@ class SlackAdapter(BasePlatformAdapter):
                 event.get("user", "") or "", event.get("bot_id", "") or "",
                 (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or "",
                 event.get("channel", ""), event.get("ts", ""), event.get("thread_ts", ""))
+        await self._emit_message_lifecycle_event(event, payload)
+        if event.get("subtype") == "message_deleted":
+            return None
         if event.get("subtype") == "message_changed":
+            updated = event.get("message")
+            bot = self._team_bot_user_ids.get(self._event_team_id(event, payload), self._bot_user_id)
+            if not isinstance(updated, dict) or not bot or f"<@{bot}>" not in _slack_mention_detection_text(updated):
+                return None
             event = self._normalize_changed_message(event)
             if event is None:
                 return None
@@ -4512,6 +4684,9 @@ class SlackAdapter(BasePlatformAdapter):
         force_process = bool(event.get("_hermes_force_process"))
         if await self._peer_bot_drop(event, user_id, bot_uid, channel_id, team_id, is_mentioned):
             return
+        if (not event.get("subtype") and user_id and user_id != bot_uid
+                and not await self._resolve_user_is_bot(user_id, chat_id=channel_id, team_id=team_id)):
+            await self._emit_message_created_event(event, payload)
         if (
             not is_one_to_one_dm and bot_uid and not await self._channel_gate_allows(
             channel_id=channel_id, routing_text=routing_text, bot_uid=bot_uid,

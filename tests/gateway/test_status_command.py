@@ -425,7 +425,7 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monkeypatch):
+async def test_first_run_does_not_send_home_channel_onboarding(monkeypatch):
     import gateway.run as gateway_run
 
     session_entry = SessionEntry(
@@ -462,10 +462,7 @@ async def test_first_run_slack_home_channel_onboarding_uses_parent_command(monke
     result = await runner._handle_message(_make_event("hello", platform=Platform.SLACK))
 
     assert result == "ok"
-    runner.adapters[Platform.SLACK].send.assert_awaited_once()
-    onboarding = runner.adapters[Platform.SLACK].send.await_args.args[1]
-    assert "/hermes sethome" in onboarding
-    assert "Type /sethome" not in onboarding
+    runner.adapters[Platform.SLACK].send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

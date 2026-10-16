@@ -143,8 +143,8 @@ class TestResetCommandWithTitle:
 
 
     @pytest.mark.asyncio
-    async def test_reset_command_duplicate_title_surfaces_warning(self):
-        """/new <title> with an already-in-use title returns a warning in the reply."""
+    async def test_reset_command_duplicate_title_keeps_reply_concise(self):
+        """A rejected /new title does not add details to the reset reply."""
         from datetime import datetime
 
         from gateway.run import GatewayRunner
@@ -190,6 +190,7 @@ class TestResetCommandWithTitle:
         runner._session_db.set_session_title.side_effect = ValueError(
             "Title 'Dup' is already in use by session abc-123"
         )
+        runner._telegram_topic_mode_enabled = lambda _source: False
         runner._agent_cache = {}
         runner._agent_cache_lock = None
         runner._is_user_authorized = lambda _source: True
@@ -199,11 +200,7 @@ class TestResetCommandWithTitle:
         result = await runner._handle_reset_command(event)
 
         runner._session_db.set_session_title.assert_called_once()
-        reply = str(result)
-        assert "already in use" in reply
-        assert "session started untitled" in reply
-        # Header must NOT claim the rejected title as the session name
-        assert "New session started: Dup" not in reply
+        assert str(result) == "session reset, starting fresh"
 
 
 # ---------------------------------------------------------------------------

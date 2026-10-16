@@ -17,6 +17,7 @@ from agent.reasoning_effort import (
     # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
     codex_supported_efforts,
 )
+from agent.tool_wire_names import encode_tool_names, decode_tool_names
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -648,6 +649,7 @@ class ResponsesApiTransport(ProviderTransport):
 
         return _responses_tools(tools)
 
+    @encode_tool_names
     def build_kwargs(
         self, model: str, messages: list[dict[str, Any]], tools: Optional[list[dict[str, Any]]] = None, **params,
     ) -> dict[str, Any]:
@@ -805,6 +807,7 @@ class ResponsesApiTransport(ProviderTransport):
         _bound_prompt_cache_key_field(kwargs.get("extra_body"))
         return kwargs
 
+    @decode_tool_names
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize Codex Responses API response to NormalizedResponse."""
         from agent.codex_responses_adapter import _normalize_codex_response

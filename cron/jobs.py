@@ -1199,7 +1199,12 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         # the wall-clock hour stays correct every calendar day, including DST
         # boundaries (morning-routine 09:00 America/Toronto).
         # Fall back to the base's own zone only when nothing is configured.
-        zone = get_timezone() or base_time.tzinfo
+        explicit_zone = schedule.get("timezone")
+        if explicit_zone:
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(explicit_zone)
+        else:
+            zone = get_timezone() or base_time.tzinfo
         base_wall = base_time.astimezone(zone).replace(tzinfo=None)
         it = croniter(expr, base_wall)
         # Strictly-after guard for the DST fall-back hour (qwen-code#11723 class):
@@ -1211,12 +1216,16 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         # hour has two instants, so two candidates always suffice.
         base_ts = base_time.timestamp()
         next_wall = it.get_next(datetime)
-        for _ in range(2):
-            for fold in (0, 1):
+        for _ in range(370 if explicit_zone else 2):
+            for fold in ((0,) if explicit_zone else (0, 1)):
                 candidate = next_wall.replace(tzinfo=zone, fold=fold)
+                if explicit_zone and candidate.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) != next_wall:
+                    continue
                 if candidate.timestamp() > base_ts:
                     return candidate.isoformat()
             next_wall = it.get_next(datetime)
+        if explicit_zone:
+            return None
         return next_wall.replace(tzinfo=zone).isoformat()
     return None
 
@@ -1754,6 +1763,11 @@ def create_job(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
+    *,
+    plugin_runner: Optional[str] = None,
+    plugin_data: Optional[Dict[str, Any]] = None,
+    enabled: Optional[bool] = None,
+    timezone: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1763,6 +1777,10 @@ def create_job(
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
+    if enabled is not None:
+        if type(enabled) is not bool or (paused and enabled):
+            raise ValueError("Conflicting or invalid enabled/paused state")
+        paused = not enabled
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1770,6 +1788,18 @@ def create_job(
     if paused_reason is not None and not paused:
         raise ValueError("paused_reason requires paused=True.")
     parsed_schedule = parse_schedule(schedule)
+    if timezone is not None:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(timezone)
+        parsed_schedule["timezone"] = timezone
+    if plugin_runner is not None:
+        if not isinstance(plugin_runner, str) or not plugin_runner.strip() or not isinstance(plugin_data, dict):
+            raise ValueError("Plugin jobs require a named runner and JSON data")
+        if script or no_agent or monitor_script or monitor_url:
+            raise ValueError("Plugin jobs cannot select another execution mode")
+        plugin_data = json.loads(json.dumps(plugin_data, allow_nan=False))
+    elif plugin_data is not None:
+        raise ValueError("plugin_data requires a runner")
     # Normalize repeat: treat 0 or negative values as None (infinite). String forms
     # ('forever'/'once'/numeric) coerce via normalize_repeat_value — the shared chokepoint with update paths
     # (#66824/#64520/#7142/#71987/#95706).
@@ -1842,6 +1872,9 @@ def create_job(
         "enabled_toolsets": f["enabled_toolsets"],
         "workdir": f["workdir"],
     }
+    if plugin_runner is not None:
+        job["plugin_runner"] = plugin_runner
+        job["plugin_data"] = plugin_data
     # Optional keys are persisted only when explicitly set: an absent key falls back to global
     # config (attach/reasoning) or to ``deliver`` (failure_deliver), byte-identical to pre-feature
     # jobs.
@@ -2925,6 +2958,8 @@ def _repair_timezone_shifted_cron(d: _DueJob) -> bool:
     at the intended local time. True when re-anchored (caller skips this tick). TRADE-OFF: a DST
     offset change meeting the same conditions SKIPS the pending occurrence; accepted as rare."""
     now = d.scan.now
+    if d.schedule.get("timezone"):
+        return False
     if not (
         _instant_at_or_before(d.next_run_dt, now)
         and _timezone_offset_mismatch(d.raw_next_run_dt, now)

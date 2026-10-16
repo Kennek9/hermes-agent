@@ -172,8 +172,8 @@ def _reply_anchor_for_event(event) -> str | None:
         if getattr(source, "chat_type", None) != "dm":
             return None
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu" and thread_id:
+        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
 
 
@@ -4273,6 +4273,7 @@ class BasePlatformAdapter(ABC):
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        event._execution_text_receipt = result
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -4437,6 +4438,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        event._execution_text_receipt = None
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
         def _record_delivery(result):
@@ -4544,6 +4546,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            from gateway.execution_observer import observe_delivery
+            await observe_delivery(event, getattr(event, "_execution_text_receipt", None))
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it

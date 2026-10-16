@@ -16,6 +16,7 @@ from agent.reasoning_effort import (
 from agent.message_sanitization import normalize_finish_reason as _normalize_finish_reason
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
+from agent.tool_wire_names import encode_tool_names, decode_tool_names
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
@@ -463,6 +464,7 @@ class ChatCompletionsTransport(ProviderTransport):
         """Tools are already in OpenAI format — identity."""
         return tools
 
+    @encode_tool_names
     def build_kwargs(
         self, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, **params,
     ) -> dict[str, Any]:
@@ -598,6 +600,7 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
         )
 
+    @decode_tool_names
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:
         """Normalize an OpenAI ChatCompletion.
 

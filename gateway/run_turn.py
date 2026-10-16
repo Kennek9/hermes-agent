@@ -1437,38 +1437,6 @@ class GatewayTurnMixin:
                 logger.debug("Profile-build onboarding directive failed, using plain intro: %s", _pb_err)
                 turn_sidecar_notes.append(_intro_note)
 
-        # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
-        if not source.platform or source.platform in (Platform.LOCAL, Platform.WEBHOOK):
-            return
-        platform_name = source.platform.value
-        env_key = _home_target_env_var(platform_name)
-        # Multiplex: the home channel may live only in the profile secret scope, not os.environ.
-        home_env = ""
-        if env_key:
-            with suppress(Exception):
-                from agent.secret_scope import get_secret
-                home_env = (get_secret(env_key) or "").strip()
-            home_env = home_env or (os.getenv(env_key) or "").strip()
-        # Also honor in-memory / yaml home_channel on this platform.
-        with suppress(Exception):
-            if not home_env and self.config.get_home_channel(source.platform):
-                home_env = "set"
-        # Secondary-profile platforms may only exist under that profile's config — re-read in scope.
-        if not home_env:
-            with suppress(Exception):
-                from gateway.config import load_gateway_config as _lgc
-                prof = (getattr(source, "profile", None) or "").strip()
-                if prof and prof != "default" and _lgc().get_home_channel(source.platform):
-                    home_env = "set"
-        if not home_env:
-            # Slack routes every command through the parent `/hermes`; bare `/sethome` would fail.
-            sethome_cmd = "/hermes sethome" if source.platform == Platform.SLACK else "/sethome"
-            await self._deliver_platform_notice(
-                source, f"📬 No home channel is set for {platform_name.title()}. "
-                f"A home channel is where Hermes delivers cron job results and cross-platform "
-                f"messages.\n\nType {sethome_cmd} to make this chat your home channel, or ignore "
-                f"to skip.",
-            )
 
     def _hmwa_apply_message_timestamp(self, event, message_text):
         """Capture the platform event time as message metadata and keep the persisted transcript
@@ -1640,12 +1608,21 @@ class GatewayTurnMixin:
         display_reasoning = escape_code_fences_for_display(display_reasoning)
         return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
-    def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
+    def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds, notice_state=None):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
         (display.runtime_footer.enabled=false)."""
         from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
         try:
-            from gateway.runtime_footer import build_footer_line as _bfl
+            from gateway.runtime_footer import build_footer_line as _bfl, context_needs_reset_notice
+            show_notice = (
+                not getattr(notice_state, "context_reset_notice_sent", False)
+                and context_needs_reset_notice(
+                    agent_result.get("last_prompt_tokens", 0) or 0,
+                    agent_result.get("context_length") or None,
+                )
+            )
+            if notice_state is not None and show_notice:
+                notice_state.context_reset_notice_sent = True
             return _bfl(
                 user_config=_load_gateway_config(),
                 platform_key=_platform_config_key(source.platform), model=agent_result.get("model"),
@@ -1654,6 +1631,7 @@ class GatewayTurnMixin:
                 cwd=_terminal_scope_cwd(""), turn_seconds=_turn_seconds,
                 requested_model=agent_result.get("requested_model"),
                 served_model=agent_result.get("served_model"),
+                include_context_notice=show_notice,
             )
         except Exception as _footer_err:
             logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -2203,6 +2181,8 @@ class GatewayTurnMixin:
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            from gateway.execution_observer import attach_execution
+            attach_execution(event, agent_result)
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
@@ -2229,7 +2209,10 @@ class GatewayTurnMixin:
                 persist_user_display_kind=prepared.persist_user_display_kind,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
-            _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
+            _footer_line = self._hmwa_runtime_footer_line(
+                agent_result, source, _turn_seconds,
+                self._session_state(session_key).conversation,
+            )
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
@@ -3992,6 +3975,7 @@ class GatewayTurnMixin:
             logger.warning(fail_result, _sk, getattr(_res, "error", None))
             return
         response["already_sent"] = True
+        response["execution_delivery_confirmed"] = getattr(_res, "success", None) is True
         logger.info(*ok)
 
     async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
@@ -4005,6 +3989,8 @@ class GatewayTurnMixin:
         if not isinstance(response, dict) or response.get("failed"):
             return
         _final = response.get("final_response") or ""
+        from gateway.execution_observer import confirm_streamed_text
+        response["execution_delivery_confirmed"] = confirm_streamed_text(_sc, _final)
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).

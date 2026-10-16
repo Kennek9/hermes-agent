@@ -643,6 +643,7 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        "turn_id": turn_id,
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()

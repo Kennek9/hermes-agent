@@ -656,6 +656,8 @@ def _rate_limit_reply(text: str) -> str:
 
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
+    if _GATEWAY_CONFIRMED_CREDIT_ERROR_RE.search(text):
+        return "⚠️ 模型服务额度已用尽，暂时无法生成回答。请联系管理员恢复额度后再试。"
     for pattern, reply in _PROVIDER_ERROR_REPLIES:
         if pattern.search(text):
             return _rate_limit_reply(text) if pattern is _GATEWAY_RATE_LIMIT_RE else reply
@@ -666,6 +668,7 @@ def _gateway_provider_error_reply(text: str) -> str:
 
 # Provider/API failure envelope preambles (not ordinary assistant prose), anchored at line start.
 _PROVIDER_ERROR_MARKERS = (
+    r"billing\s+or\s+credits\s+exhausted\s*:",
     r"api\s+(?:call\s+)?failed", r"provider\s+authentication\s+failed", r"non-retryable\s+error",
     r"rate\s+limited\s+after\s+\d+\s+retries", r"error\s+code\s*:", r"http\s*\d{3}\b",
     r"incorrect\s+api\s+key", r"invalid\s+api\s+key")
@@ -676,6 +679,12 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     re.IGNORECASE)
 
 
+_GATEWAY_CONFIRMED_CREDIT_ERROR_RE = re.compile(
+    r"(no\s+credits\s+remaining|insufficient_(?:quota|credits))",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is a provider failure envelope, not normal content.
 
@@ -683,6 +692,8 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if not text:
         return False
     body = str(text).strip()
+    if body.startswith("Billing or credits exhausted:"):
+        return True
     if len(body) > 400 or body.count("\n") > 4:
         return False
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
@@ -736,6 +747,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if _GATEWAY_CONFIRMED_CREDIT_ERROR_RE.search(text) and _looks_like_gateway_provider_error(text):
+        return None
     # Opt-in `compression.progress_notices` lets ROUTINE (template-derived) progress through; other noise stays.
     if _TELEGRAM_NOISY_STATUS_RE.search(text) and not (
         _gateway_compression_progress_notices_enabled() and _COMPRESSION_PROGRESS_STATUS_RE.search(text)

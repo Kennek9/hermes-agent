@@ -2978,6 +2978,23 @@ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required
             _maybe_ctx = memory_manager.on_pre_compress(messages, evidence_messages=evidence_messages)
             if isinstance(_maybe_ctx, str):
                 memory_context = sanitize_memory_context(_maybe_ctx)
+    # Durable, source-anchored checkpoint supplied by optional plugins.
+    # Reuse the context engine's existing memory_context boundary and budget.
+    try:
+        from hermes_cli.lifecycle import invoke_hook as _handoff_hook
+        for _handoff in _handoff_hook(
+            "context_handoff",
+            session_id=agent.session_id,
+            parent_session_id=getattr(agent, "_parent_session_id", None),
+            sender_id=getattr(agent, "_user_id", None),
+        ):
+            if isinstance(_handoff, dict) and isinstance(_handoff.get("context"), str):
+                _checkpoint = sanitize_memory_context(_handoff["context"])
+                if _checkpoint:
+                    memory_context = "\n".join(filter(None, [memory_context, _checkpoint]))
+    except Exception:
+        logger.warning("Optional context handoff unavailable; preserving native compression")
+
     return memory_context
 
 

@@ -1,9 +1,8 @@
 """Tests for the approvals.destructive_slash_confirm config gate.
 
 Destructive session slash commands (/clear, /new, /reset, /undo) discard
-conversation state.  This config key (default True) gates a three-option
-confirmation prompt — "Always Approve" flips the key to False so future
-destructive commands run silently.
+conversation state. This config key defaults to False so an explicit reset
+command runs immediately. Operators can opt back into confirmation prompts.
 
 See gateway/run.py::_maybe_confirm_destructive_slash and
 cli.py::_confirm_destructive_slash for the runtime gate.
@@ -16,10 +15,8 @@ from hermes_cli.config import DEFAULT_CONFIG
 
 class TestDestructiveSlashConfirmDefault:
 
-    def test_default_is_true(self):
-        # New installs confirm by default — destructive commands must not
-        # silently wipe history without an explicit user "yes".
-        assert DEFAULT_CONFIG["approvals"]["destructive_slash_confirm"] is True
+    def test_default_allows_explicit_reset_without_extra_confirmation(self):
+        assert DEFAULT_CONFIG["approvals"]["destructive_slash_confirm"] is False
 
 
 class TestUserConfigMerge:
@@ -44,5 +41,4 @@ class TestUserConfigMerge:
         importlib.reload(cfg_mod)
 
         cfg = cfg_mod.load_config()
-        assert cfg["approvals"]["destructive_slash_confirm"] is True
-
+        assert cfg["approvals"]["destructive_slash_confirm"] is False

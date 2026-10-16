@@ -448,10 +448,8 @@ class TestAdapterBehavior(unittest.TestCase):
             run_threadsafe.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_user_reaction_with_managed_emoji_is_still_routed(self):
-        # Operator-origin filter is enough to prevent feedback loops; we must
-        # not additionally swallow user-origin reactions just because their
-        # emoji happens to collide with a lifecycle emoji.
+    def test_user_reaction_does_not_start_a_conversation(self):
+        # Reactions are feedback, not new prompts for the agent.
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -465,16 +463,11 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         data = SimpleNamespace(event=event)
 
-        def _close_coro_and_return_future(coro, _loop):
-            coro.close()
-            return SimpleNamespace(add_done_callback=lambda _: None)
-
         with patch(
-            "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe",
-            side_effect=_close_coro_and_return_future,
+            "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe"
         ) as run_threadsafe:
             adapter._on_reaction_event("im.message.reaction.created_v1", data)
-        run_threadsafe.assert_called_once()
+        run_threadsafe.assert_not_called()
 
     def _build_reaction_adapter(self, *, msg_sender_id: str):
         """Build a FeishuAdapter wired up to return a single GET-message result."""
@@ -1704,7 +1697,7 @@ class TestGroupMentionAtAll(unittest.TestCase):
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
     def test_at_all_still_requires_policy_gate(self):
-        """@_all bypasses mention gating but NOT the allowlist policy."""
+        """Broadcast mentions never activate Tada; direct mentions still require an allowed sender."""
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -1713,9 +1706,15 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Non-allowlisted user — should be blocked even with @_all.
         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
         self.assertFalse(_admits_group(adapter, message, blocked_sender, ""))
-        # Allowlisted user — should pass.
+        # An allowlisted sender still needs a direct bot mention.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
+        self.assertFalse(_admits_group(adapter, message, allowed_sender, ""))
+        adapter._bot_open_id = "ou_bot"
+        message.mentions = [SimpleNamespace(
+            key="@_user_1", name="Tada", id=SimpleNamespace(open_id="ou_bot", user_id=None)
+        )]
         self.assertTrue(_admits_group(adapter, message, allowed_sender, ""))
+        self.assertFalse(_admits_group(adapter, message, blocked_sender, ""))
 
 
 

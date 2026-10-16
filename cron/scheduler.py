@@ -2488,6 +2488,31 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    if job.get("plugin_runner"):
+        from copy import deepcopy
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        import inspect
+
+        discover_plugins()
+        callback = get_plugin_manager().get_cron_job_runner(str(job["plugin_runner"]))
+        if callback is None:
+            return False, "Plugin task runner unavailable.", "", "plugin_runner_unavailable"
+        try:
+            result = callback(job=deepcopy(job), cancel_event=cancel_event)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                return False, "Invalid plugin runner result.", "", "plugin_runner_invalid"
+            if (not isinstance(result, tuple) or len(result) != 4
+                    or not isinstance(result[0], bool)
+                    or not all(isinstance(value, str) for value in result[1:3])
+                    or (result[3] is not None and not isinstance(result[3], str))):
+                return False, "Invalid plugin runner result.", "", "plugin_runner_invalid"
+            return result
+        except Exception:
+            logger.warning("Plugin cron runner failed for job %s", job_id)
+            return False, "Plugin task failed.", "", "plugin_runner_failed"
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
@@ -4028,6 +4053,12 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    if job.get("plugin_runner"):
+        if (claimed_job.get("plugin_runner") != job.get("plugin_runner")
+                or claimed_job.get("plugin_data") != job.get("plugin_data")):
+            finish_execution(job["execution_id"], success=False, error="Plugin task changed before claim.")
+            return True
+        claimed_job["scheduled_for"] = job.get("_scheduled_instant") or job.get("next_run_at")
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 

@@ -109,6 +109,7 @@ VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
+    "gateway_delivery", "context_handoff",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
@@ -836,6 +837,29 @@ class PluginContext:
         logger.debug("Plugin %s registered Slack action handler: %s", self.manifest.name, action_id)
         return handle
 
+    def register_slack_event_handler(self, event_type: str, callback: Callable) -> PluginRegistration:
+        """Register an SDK observer with additive event/body/client keyword fields."""
+        if not isinstance(event_type, str) or not event_type.strip() or not callable(callback):
+            raise self._refuse("an invalid Slack event handler")
+        entry = (event_type, callback, self.manifest.name)
+        handlers = self._manager._slack_event_handlers
+        handlers.append(entry)
+        return self._track("slack_event_handler", event_type,
+                           lambda: self._manager._remove_identity(handlers, entry))
+
+    @_serialized_replacement
+    def register_cron_job_runner(self, name: str, callback: Callable) -> PluginRegistration:
+        """Register a synchronous profile-owned runner, with identity-safe disposal."""
+        if not isinstance(name, str) or not name.strip() or not callable(callback):
+            raise self._refuse("an invalid cron job runner")
+        if self._manager.get_cron_job_runner(name) is not None:
+            raise self._refuse("a duplicate cron job runner")
+        entry = (name, callback, self.manifest.name)
+        runners = self._manager._cron_job_runners
+        runners.append(entry)
+        return self._track("cron_job_runner", name,
+                           lambda: self._manager._remove_identity(runners, entry))
+
     def register_platform_handler(self, platform: str, factory: Callable) -> None:
         """Register ``factory(native, adapter)``, invoked at ``connect()`` before/as the core handlers
         register (``adapter`` read-only). ``native``: telegram PTB ``Application``, discord
@@ -1193,6 +1217,8 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
         self._approval_transports: Dict[str, Any] = {}
         self._slack_action_handlers: List[tuple] = []
+        self._slack_event_handlers: List[tuple] = []
+        self._cron_job_runners: List[tuple] = []
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: List[Callable] = []
@@ -1490,6 +1516,14 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     def _scan_entry_points(self) -> List[PluginManifest]:
         """Read installed plugin entry points (see :func:`discover_entrypoint_manifests`)."""
         return discover_entrypoint_manifests()
+
+    def get_cron_job_runner(self, name: str) -> Optional[Callable]:
+        """Resolve a runner only within this manager's owning profile."""
+        return next((cb for key, cb, _owner in self._cron_job_runners if key == name), None)
+
+    def get_slack_event_handlers(self) -> List[tuple]:
+        """Return a snapshot; callers cannot mutate another registration."""
+        return list(self._slack_event_handlers)
 
     def get_slack_action_handlers(self) -> List[tuple]:
         """``(action_id, callback, plugin_name)`` tuples for the Slack adapter to wire at connect."""

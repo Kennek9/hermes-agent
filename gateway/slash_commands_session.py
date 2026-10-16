@@ -184,21 +184,11 @@ class GatewaySessionCommandsMixin:
         _old_sid = old_entry.session_id if old_entry else None
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
-        # Scoped to the profile serving this source so a multiplexed /new banner reports the
-        # profile's model, not the base config's.
-        try:
-            session_info = await asyncio.to_thread(self._reset_notice_session_info, source)
-        except Exception:
-            session_info = ""
-        if new_entry:
-            default_header = t("gateway.reset.header_default")
-        else:  # no existing session: create one
+        if not new_entry:
             new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
-            default_header = t("gateway.reset.header_new")
-        header = await asyncio.to_thread(self._telegram_topic_new_header, source) or default_header
-        _title_arg = event.get_command_args().strip()
-        if _title_arg and self._session_db and new_entry:
-            header = await self._reset_titled_header(header, new_entry.session_id, _title_arg)
+        title_arg = event.get_command_args().strip()
+        if title_arg and self._session_db and new_entry:
+            await self._reset_titled_header("", new_entry.session_id, title_arg)
         # Telegram DM topic lane: rebind (chat_id, thread_id) → session_id so the next message uses
         # the fresh session instead of switching back to the old one.
         if await asyncio.to_thread(self._is_telegram_topic_lane, source) and new_entry is not None:
@@ -215,13 +205,7 @@ class GatewaySessionCommandsMixin:
                          old_session_id=_old_sid, new_session_id=_new_sid)
         except Exception:
             pass
-        try:
-            from hermes_cli.tips import get_random_tip
-            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
-        except Exception:
-            _tip_line = ""
-        body = f"{header}\n\n{session_info}" if session_info else header
-        return EphemeralReply(f"{body}{_tip_line}")
+        return EphemeralReply("session reset, starting fresh")
 
     async def _reset_titled_header(self, header: str, session_id: str, title_arg: str) -> str:
         """``/new <title>``: titled header on success, else the header plus a rejection note."""

@@ -101,6 +101,7 @@ class ClassifiedError:
 # named account, the tier refusing for an anonymous one (see ``_WELCOME_403_NAMED_PATTERNS``).
 _FREE_TIER_REFUSAL_PATTERNS = ("model_not_supported_on_free_tier", "not available on the free tier")
 _BILLING_PATTERNS = (
+    "no credits remaining",
     "insufficient credits", "insufficient_quota", "insufficient balance", "credit balance",
     "credits exhausted", "credits have been exhausted", "requires available credits",
     "account balance is too low", "no usable credits", "top up your credits", "payment required",
@@ -1041,7 +1042,7 @@ def _status_429(c: _Ctx) -> Verdict:
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
     # this handler always returns, so _by_error_code never sees the code.
-    if c.code in _BILLING_ERROR_CODES:
+    if c.code in _BILLING_ERROR_CODES or "no credits remaining" in c.msg:
         return _V_BILLING
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).

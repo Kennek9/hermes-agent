@@ -50,6 +50,7 @@ class ConversationState:
     queued_events: List[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)
     sidecar_notes: List[str] = field(default_factory=list)  # one-shot must-deliver notes
     ephemeral_pin: Optional[Tuple[Any, ...]] = None  # pinned session-context (change_key, text)
+    context_reset_notice_sent: bool = False
     vc_last: Optional[str] = None  # last voice-channel context delivered
 
     def clear(self) -> None:

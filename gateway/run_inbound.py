@@ -91,6 +91,12 @@ class GatewayInboundMixin:
                     _result.get("reason"), source.platform.value if source.platform else "unknown",
                     source.chat_id or "unknown",
                 )
+                reply = _result.get("reply")
+                adapter = self._delivery_adapter_for(source)
+                if adapter is not None and isinstance(reply, str) and reply:
+                    await adapter._send_with_retry(
+                        chat_id=source.chat_id, content=reply, reply_to=event.message_id,
+                    )
                 return None
             if _action == "rewrite":
                 _new_text = _result.get("text")

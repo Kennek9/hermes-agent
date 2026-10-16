@@ -791,6 +791,32 @@ class GatewayBusySessionMixin:
             return True
         event._bot_loop_admitted = True
 
+        # Weixin attachment intake must run before busy interrupt/queue routing.
+        # The plugin persists uploads independently from the conversational agent.
+        if event.source.platform == Platform.WEIXIN and not getattr(event, "internal", False):
+            from hermes_cli.lifecycle import invoke_hook
+            try:
+                results = invoke_hook(
+                    "pre_gateway_dispatch", event=event, gateway=self,
+                    session_store=getattr(self, "session_store", None),
+                )
+            except Exception:
+                logger.exception("Weixin busy intake failed")
+                results = [{"action": "skip", "reply": "附件或消息尚未入库：接收失败，请重新发送。"}]
+            for result in results:
+                if isinstance(result, dict) and result.get("action") == "skip":
+                    reply = result.get("reply")
+                    adapter = self._delivery_adapter_for(event.source)
+                    if adapter and isinstance(reply, str) and reply:
+                        try:
+                            await adapter._send_with_retry(
+                                chat_id=event.source.chat_id, content=reply,
+                                reply_to=event.message_id,
+                            )
+                        except Exception:
+                            logger.exception("Weixin intake receipt delivery failed")
+                    return True
+
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)

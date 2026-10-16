@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence
@@ -931,10 +931,10 @@ def _build_mentions_map(mentions: Optional[Sequence[Any]], bot: _FeishuBotIdenti
         key = str(getattr(mention, "key", "") or "")
         if not key:
             continue
-        if key == "@_all":
+        open_id, user_id = _extract_mention_ids(mention)
+        if key == "@_all" or "all" in (open_id, user_id):
             result[key] = FeishuMentionRef(is_all=True)
             continue
-        open_id, user_id = _extract_mention_ids(mention)
         name = str(getattr(mention, "name", "") or "").strip()
         is_self = bot.matches(open_id=open_id, user_id=user_id, name=name)
         result[key] = FeishuMentionRef(name=name, open_id=open_id, is_self=is_self)
@@ -1423,8 +1423,12 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
+        builder = EventDispatcherHandler.builder(self._encrypt_key, self._verification_token)
+        register_p1 = getattr(builder, "register_p1_customized_event", None)
+        if register_p1 is not None:
+            builder = register_p1("message", self._on_legacy_message_event)
         return (
-            EventDispatcherHandler.builder(self._encrypt_key, self._verification_token)
+            builder
             .register_p2_im_message_message_read_v1(self._on_message_read_event)
             .register_p2_im_message_receive_v1(self._on_message_event)
             .register_p2_im_message_reaction_created_v1(lambda d: self._on_reaction_event("im.message.reaction.created_v1", d))
@@ -1434,6 +1438,10 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
             .register_p2_im_message_recalled_v1(self._on_message_recalled)
+            .register_p2_customized_event("im.chat.member.user.added_v1", lambda data: self._on_member_changed("member_added", data))
+            .register_p2_customized_event("im.chat.member.user.deleted_v1", lambda data: self._on_member_changed("member_removed", data))
+            .register_p2_customized_event("im.chat.member.user.withdrawn_v1", lambda data: self._on_member_changed("member_withdrawn", data))
+            .register_p2_customized_event("vc.meeting.all_meeting_ended_v1", self._on_company_meeting_ended)
             .register_p2_customized_event("drive.notice.comment_add_v1", self._on_drive_comment_event)
             .register_p2_customized_event("vc.bot.meeting_invited_v1", self._on_meeting_invited_event)
             .build()
@@ -1971,6 +1979,169 @@ class FeishuAdapter(BasePlatformAdapter):
         return content.strip()
 
     # --- Inbound event handlers ---
+    def _on_legacy_message_event(self, data: Any) -> None:
+        """Route legacy Channel ``message`` events through the normal handler."""
+        event = getattr(data, "event", None)
+        if not isinstance(event, dict):
+            logger.debug("[Feishu] Dropping malformed legacy message event")
+            return
+
+        # The legacy flag includes broadcasts. Only the provider's removal of
+        # a bot-specific mention proves this message was directed at this bot.
+        original_text = str(event.get("text") or "")
+        without_bot = event.get("text_without_at_bot")
+        directly_mentioned = (
+            event.get("is_mention") is True
+            and bool(original_text)
+            and (
+                (isinstance(without_bot, str) and original_text.strip() != without_bot.strip())
+                # Legacy events omit the stripped field for a bare @bot.
+                or (
+                    without_bot is None
+                    and bool(self._bot_name)
+                    and original_text.strip() == "@" + self._bot_name
+                )
+            )
+        )
+        mentions = [{
+            "key": "@_user_1",
+            "id": {"open_id": self._bot_open_id, "user_id": self._bot_user_id},
+            "name": self._bot_name,
+        }] if directly_mentioned else []
+        text = without_bot if isinstance(without_bot, str) else original_text
+        envelope = {"event": {
+            "message": {
+                "message_id": str(event.get("open_message_id") or event.get("message_id") or ""),
+                "chat_id": str(event.get("open_chat_id") or event.get("chat_id") or ""),
+                "chat_type": "p2p" if event.get("chat_type") == "private" else "group",
+                "message_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+                "mentions": mentions,
+                "root_id": event.get("root_id"),
+                "parent_id": event.get("parent_id"),
+            },
+            "sender": {"sender_type": "user", "sender_id": {
+                "open_id": str(event.get("open_id") or ""),
+                "user_id": str(event.get("user_id") or event.get("employee_id") or ""),
+                "union_id": str(event.get("union_id") or ""),
+            }},
+        }}
+        self._on_message_event(self._namespace_from_mapping(envelope))
+
+
+    def _on_member_changed(self, event_type: str, data: Any) -> None:
+        """Forward group membership changes to the knowledge permission store."""
+        if not self._platform_events_subscribed():
+            return
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            return
+        event = getattr(data, "event", None) or data
+        chat_id = str(getattr(event, "chat_id", "") or "")
+        members = getattr(event, "users", None) or ()
+        event_at = self._chat_evidence_timestamp(getattr(event, "event_time", None))
+        event_at = event_at or datetime.now(timezone.utc)
+        for member in members:
+            identity = getattr(member, "user_id", None)
+            actor_id = getattr(identity, "user_id", None) or getattr(
+                identity, "open_id", None
+            )
+            if not chat_id or not actor_id:
+                continue
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_type="group",
+                user_id=str(actor_id),
+                message_id=None,
+            )
+            normalized = {
+                "platform": "feishu",
+                "event_type": event_type,
+                "payload": {
+                    "chat_id": chat_id[:128],
+                    "actor_id": str(actor_id)[:128],
+                    "event_at": event_at.isoformat(),
+                },
+            }
+            self._submit_on_loop(
+                loop,
+                self._fire_platform_event(normalized, source),
+            )
+
+
+    @staticmethod
+    def _chat_evidence_timestamp(value: Any) -> datetime | None:
+        """Shared timestamp conversion for message and membership events."""
+        from plugins.platforms.feishu.chat_evidence import evidence_timestamp
+
+        return evidence_timestamp(value)
+
+
+    async def _emit_chat_evidence_message(self, message: Any, sender: Any) -> None:
+        """Observe before reply admission; storage never fetches message resources."""
+        from plugins.platforms.feishu.chat_evidence import build_chat_evidence
+
+        if (
+            getattr(self, "_platform_event_handler", None) is None
+            or not self._platform_events_subscribed()
+        ):
+            return
+        normalized = normalize_feishu_message(
+            message_type=getattr(message, "message_type", "") or "",
+            raw_content=getattr(message, "content", "") or "",
+            mentions=getattr(message, "mentions", None),
+            bot=self._bot_identity(),
+        )
+        evidence = build_chat_evidence(message, sender, normalized.text_content)
+        if evidence is None:
+            return
+        source = self.build_source(
+            chat_id=evidence.chat_id,
+            chat_type=evidence.chat_type,
+            user_id=evidence.sender_id,
+            message_id=evidence.message_id,
+        )
+        for event in evidence.events:
+            await self._fire_platform_event(event, source)
+
+
+    def _on_company_meeting_ended(self, data: Any) -> None:
+        """Persist SDK-authenticated enterprise events without starting an agent turn."""
+        import lark_oapi as lark
+        from hermes_cli.lifecycle import invoke_hook
+
+        results = invoke_hook(
+            "gateway_platform_event",
+            platform="feishu",
+            event_type="company_meeting_ended",
+            payload={"raw_event": lark.JSON.marshal(data)},
+        )
+        if "tada_company_meeting_enqueued" not in results:
+            raise RuntimeError("Corporate meeting event was not queued")
+
+
+    @staticmethod
+    def _platform_events_subscribed() -> bool:
+        """Return whether a plugin consumes normalized platform events."""
+        try:
+            from hermes_cli.lifecycle import has_hook
+
+            return has_hook("gateway_platform_event")
+        except Exception:
+            return False
+
+
+    async def _fire_platform_event(self, event: Dict[str, Any], source: Any) -> None:
+        """Forward one normalized event to the gateway hook boundary."""
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None:
+            return
+        try:
+            await handler(event, source)
+        except Exception:
+            logger.debug("[Feishu] gateway_platform_event dispatch failed", exc_info=True)
+
+
     def _on_message_event(self, data: Any) -> None:
         """SDK dispatcher callback (background thread); queues for replay while the loop isn't ready."""
         loop = self._loop
@@ -2072,6 +2243,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message_id or await self._is_duplicate(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
+        try:
+            await self._emit_chat_evidence_message(message, sender)
+        except Exception:
+            logger.debug("[Feishu] chat-evidence normalization failed", exc_info=True)
         reason = self._admit(sender, message)
         if reason is not None:
             logger.debug("[Feishu] dropping inbound event: %s", reason)
@@ -2127,7 +2302,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._submit_if_ready("meeting invite event", lambda: handle_meeting_invited_event(self, data))
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
-        """Route user reactions on bot messages as synthetic text events."""
+        """Observe reactions without starting an agent conversation."""
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         operator_type = str(getattr(event, "operator_type", "") or "")
@@ -2136,14 +2311,11 @@ class FeishuAdapter(BasePlatformAdapter):
         action = "added" if "created" in event_type else "removed"
         logger.debug(
             "[Feishu] Reaction %s on message %s (operator_type=%s, emoji=%s)",
-            action, message_id, operator_type, emoji_type,
+            action,
+            message_id,
+            operator_type,
+            emoji_type,
         )
-        # Drop bot/app-origin reactions to break the feedback loop from our own lifecycle
-        # reactions; a human clicking the same emoji is still routed through.
-        loop = self._loop
-        if operator_type in {"bot", "app"} or not message_id or not self._loop_accepts_callbacks(loop):
-            return
-        self._submit_on_loop(loop, self._handle_reaction_event(event_type, data))
 
     def _on_card_action_trigger(self, data: Any) -> Any:
         """Synchronous SDK card-action callback.
@@ -2472,6 +2644,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
         """Run one event through the agent pipeline under the per-chat lock (openclaw createChatQueue)."""
+        if event.source is not None:
+            from gateway.session_identity import replace_source
+            event.source = replace_source(event.source, message_id=event.message_id)
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
@@ -2825,6 +3000,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
         event_type = str((payload.get("header") or {}).get("event_type") or "")
         data = self._namespace_from_mapping(payload)
+        membership_events = {
+            "im.chat.member.user.added_v1": "member_added",
+            "im.chat.member.user.deleted_v1": "member_removed",
+            "im.chat.member.user.withdrawn_v1": "member_withdrawn",
+        }
+        if event_type in membership_events:
+            self._on_member_changed(membership_events[event_type], data)
+            return web.json_response({"code": 0, "msg": "ok"})
         if event_type in {"im.message.reaction.created_v1", "im.message.reaction.deleted_v1"}:
             self._on_reaction_event(event_type, data)
         else:
@@ -3424,8 +3607,6 @@ class FeishuAdapter(BasePlatformAdapter):
     def _mentions_self(self, message: Any) -> bool:
         # @_all is Feishu's @everyone placeholder.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
-            return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
@@ -3433,16 +3614,15 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._post_mentions_bot(normalized.mentions)
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
-        # Same precedence as _FeishuBotIdentity.matches (open_id > user_id > name); a non-empty
-        # bot_name here only matches an exact stripped name, while an empty bot_name never matches.
+        # Use the same ID precedence as rich-text normalization; keeping two
+        # matchers here previously let the admission and rendering paths drift.
         bot = self._bot_identity()
         for mention in mentions:
-            mention_id = getattr(mention, "id", None)
-            if bot.matches(
-                open_id=(getattr(mention_id, "open_id", None) or "").strip(),
-                user_id=(getattr(mention_id, "user_id", None) or "").strip(),
-                name=(getattr(mention, "name", None) or "").strip(),
-            ):
+            open_id, user_id = _extract_mention_ids(mention)
+            if getattr(mention, "key", "") == "@_all" or "all" in (open_id, user_id):
+                continue
+            name = str(getattr(mention, "name", "") or "").strip()
+            if bot.matches(open_id=open_id.strip(), user_id=user_id.strip(), name=name):
                 return True
         return False
 
