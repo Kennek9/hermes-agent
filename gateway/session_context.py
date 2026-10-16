@@ -179,6 +179,19 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_trusted_session_value(name: str, default: str = "") -> str:
+    """Read only request-bound gateway context; environment values never prove identity.
+
+    Plugins use this for actors and routing. Unknown, never-bound and explicitly cleared
+    variables return the caller's default rather than borrowing a CLI or cron environment.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    return value if isinstance(value, str) and value else default
+
+
 # Surfaces that are not a human chat channel (gateway binds HERMES_SESSION_PLATFORM, CLI/TUI/
 # desktop bind HERMES_SESSION_SOURCE, so both are consulted).  Default-deny: an unrecognized
 # identity counts as messaging.  Mirrors LOCAL_SESSION_SOURCE_IDS in apps/desktop session-source.ts.

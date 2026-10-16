@@ -195,6 +195,8 @@ class ToolEntry:
     # Zero-arg callable whose dict is shallow-merged onto the schema at every get_definitions()
     # — for fields tracking runtime config (delegate_task's description reflects limits).
     dynamic_schema_overrides: Optional[Callable] = None
+    model_visible: bool = True
+    deprecated: bool = False
 
 
 class _PluginOverridePolicy:
@@ -486,13 +488,17 @@ class ToolRegistry:
     def _snapshot_entries(self) -> List[ToolEntry]:
         return self._snapshot_state()[0]
 
+    def _snapshot_model_entries(self) -> List[ToolEntry]:
+        """Model-facing entries; hidden compatibility handlers remain in the raw registry."""
+        return [entry for entry in self._snapshot_entries() if entry.model_visible]
+
     def _toolset_has_exposable_tools(self, toolset: str, entries: List[ToolEntry]) -> bool:
         """True when at least one tool in *toolset* would be exposed. Mirrors
         :meth:`get_definitions` per-tool filtering so doctor/banners agree with runtime:
         mixed toolsets (``terminal`` + desktop-only ``read_terminal``) must not be gated
         by the first ``check_fn``."""
         memo: Dict[Callable, bool] = {}
-        members = (e for e in entries if e.toolset == toolset)
+        members = (e for e in entries if e.toolset == toolset and e.model_visible)
         return any(not e.check_fn or _memo_check(e.check_fn, memo) for e in members)
 
     def get_entry(self, name: str, *, scope: Optional[str] = None) -> Optional[ToolEntry]:
@@ -514,13 +520,14 @@ class ToolRegistry:
             return self._slot(scope).get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
-        return sorted(self._grouped(self._snapshot_entries()))
+        return sorted(self._grouped(self._snapshot_model_entries()))
 
-    def get_all_entries(self) -> List[ToolEntry]:
-        return self._snapshot_entries()
+    def get_all_entries(self, *, include_hidden: bool = False) -> List[ToolEntry]:
+        """Enumerate model-visible tools, or every registration for host introspection."""
+        return self._snapshot_entries() if include_hidden else self._snapshot_model_entries()
 
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
-        return sorted(e.name for e in self._grouped(self._snapshot_entries()).get(toolset, []))
+        return sorted(e.name for e in self._grouped(self._snapshot_model_entries()).get(toolset, []))
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
@@ -664,10 +671,12 @@ class ToolRegistry:
         check_fn: Callable = None, requires_env: list = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None, override: bool = False,
-        scope: Optional[str] = None):
+        scope: Optional[str] = None, *, model_visible: bool = True, deprecated: bool = False):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
-        browser backend); without it, cross-toolset shadowing is rejected."""
+        browser backend); without it, cross-toolset shadowing is rejected. ``model_visible=False``
+        keeps a compatibility handler dispatchable without advertising it to the model.
+        ``deprecated`` records migration status independently of visibility."""
         # Reject malformed schemas at registration, not at request time: a non-dict
         # ``parameters`` (e.g. a list) serializes into every provider request and 400s the
         # whole turn far from the offending plugin. Failing here names the culprit instead.
@@ -728,7 +737,8 @@ class ToolRegistry:
                 requires_env=requires_env or [], is_async=is_async,
                 description=description or schema.get("description", ""), emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
-                dynamic_schema_overrides=dynamic_schema_overrides)
+                dynamic_schema_overrides=dynamic_schema_overrides,
+                model_visible=model_visible, deprecated=deprecated)
             # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
             # longer gates a toolset; it still feeds get_toolset_requirements ->
             # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
@@ -839,7 +849,7 @@ class ToolRegistry:
         absent). Probes use the ~30 s TTL cache so ``hermes tools enable`` lands quickly."""
         result = []
         check_results: Dict[Callable, bool] = {}
-        entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
+        entries_by_name = {entry.name: entry for entry in self._snapshot_model_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
@@ -930,7 +940,7 @@ class ToolRegistry:
         return DEFAULT_RESULT_SIZE_CHARS
 
     def get_all_tool_names(self) -> List[str]:
-        return sorted(entry.name for entry in self._snapshot_entries())
+        return sorted(entry.name for entry in self._snapshot_model_entries())
 
     def get_schema(self, name: str) -> Optional[dict]:
         """Raw schema dict, bypassing check_fn filtering (token estimates, introspection)."""
@@ -944,7 +954,7 @@ class ToolRegistry:
         return self._attr(name, "emoji") or default
 
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
-        return {entry.name: entry.toolset for entry in self._snapshot_entries()}
+        return {entry.name: entry.toolset for entry in self._snapshot_model_entries()}
 
     def is_toolset_available(self, toolset: str) -> bool:
         """True when a toolset has at least one exposable tool (never raises)."""
@@ -952,14 +962,14 @@ class ToolRegistry:
 
 
     def check_toolset_requirements(self) -> Dict[str, bool]:
-        entries = self._snapshot_entries()
+        entries = self._snapshot_model_entries()
         return {
             toolset: self._toolset_has_exposable_tools(toolset, entries)
             for toolset in sorted(self._grouped(entries))}
 
     def get_available_toolsets(self) -> Dict[str, dict]:
         """Return toolset metadata for UI display."""
-        entries = self._snapshot_entries()
+        entries = self._snapshot_model_entries()
         toolsets: Dict[str, dict] = {}
         for toolset, members in self._grouped(entries).items():
             toolsets[toolset] = {
@@ -971,7 +981,9 @@ class ToolRegistry:
 
     def get_toolset_requirements(self) -> Dict[str, dict]:
         """Build a TOOLSET_REQUIREMENTS-compatible dict for backward compat."""
-        entries, toolset_checks = self._snapshot_state()
+        entries = self._snapshot_model_entries()
+        toolset_checks = {
+            entry.toolset: entry.check_fn for entry in entries if entry.check_fn is not None}
         result: Dict[str, dict] = {}
         for toolset, members in self._grouped(entries).items():
             result[toolset] = {
@@ -985,7 +997,7 @@ class ToolRegistry:
     def check_tool_availability(self, quiet: bool = False):
         """Return (available_toolsets, unavailable_info) like the old function."""
         available, unavailable = [], []
-        entries = self._snapshot_entries()
+        entries = self._snapshot_model_entries()
         groups = self._grouped(entries)
         for ts in sorted(groups):
             if self._toolset_has_exposable_tools(ts, entries):

@@ -31,6 +31,22 @@ from pathlib import Path
 
 import pytest
 
+
+def pytest_addoption(parser):
+    parser.addoption("--tada-release-plugin-parent", default=None,
+                     help="Explicit reviewed Tada release plugin directory for native contracts")
+
+
+@pytest.fixture
+def tada_release_plugin_parent(pytestconfig):
+    value = pytestconfig.getoption("--tada-release-plugin-parent")
+    if not value:
+        pytest.fail("Pass --tada-release-plugin-parent for Tada release contracts")
+    parent = Path(value).resolve(strict=True)
+    for name in ("company_knowledge_v1", "table_workflows"):
+        assert (parent / name / "plugin.yaml").is_file()
+    return parent
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:

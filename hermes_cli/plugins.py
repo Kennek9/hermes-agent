@@ -416,17 +416,64 @@ class PluginContext:
         logger.debug("Plugin %s registered on_unload callback", self.manifest.name)
         return handle
 
-    def spawn_task(self, coro, *, name: Optional[str] = None) -> "asyncio.Task":
-        """Spawn a supervised asyncio task; unload/force reload cancels it. Needs a running loop."""
+    @_serialized_replacement
+    def spawn_task(self, coro, *, name: Optional[str] = None):
+        """Spawn supervised work on this profile's host loop, including from sync tool threads.
+
+        A manager first seen on an async gateway activity remembers that loop. A synchronous
+        caller cannot create an unsupervised loop or borrow another profile's manager.
+        """
         if not asyncio.iscoroutine(coro):
             raise TypeError("spawn_task expects a coroutine")
-        loop = asyncio.get_running_loop()
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        loop = self._manager._task_loop
+        if loop is None or loop.is_closed():
+            loop = current_loop
+        if loop is None or not loop.is_running():
+            coro.close()
+            raise RuntimeError("spawn_task requires an active profile host loop")
+        self._manager._task_loop = loop
         task_name = name or f"plugin:{self.plugin_id}:task"
-        task = loop.create_task(coro, name=task_name)
-        handle = self._track("background_task", task_name, lambda: task.done() or task.cancel())
+        if current_loop is loop:
+            task = loop.create_task(coro, name=task_name)
+            cancel = lambda: task.done() or loop.call_soon_threadsafe(task.cancel)
+        else:
+            task = asyncio.run_coroutine_threadsafe(coro, loop)
+            cancel = lambda: task.done() or task.cancel()
+        handle = self._track("background_task", task_name, cancel)
         task.add_done_callback(lambda _t: handle.dispose())
         logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
         return task
+
+    def session_value(self, name: str, default: str = "") -> str:
+        """Read trusted request-local gateway context, without an environment fallback."""
+        from gateway.session_context import get_trusted_session_value
+        return get_trusted_session_value(name, default)
+
+    def run_async(self, awaitable):
+        """Run async work from a synchronous handler using Hermes' scoped async bridge."""
+        from model_tools import _run_async
+        return _run_async(awaitable)
+
+    async def send_platform_message(
+        self, platform: str, chat_id: str, text: str, *,
+        reply_to: str | None = None, metadata: dict | None = None,
+    ) -> dict:
+        """Send through the owning live adapter; requires gateway.platform_actions consent.
+
+        Slack metadata must identify an exact workspace. ``blocks`` are delivered as native
+        Block Kit, with ``text`` retained as the accessibility and notification fallback.
+        """
+        return await self.platform_actions.send_message(
+            platform, chat_id, text, reply_to=reply_to, metadata=metadata,
+        )
+
+    async def call_slack_api(self, workspace_id: str, method: str, **params) -> dict:
+        """Read Slack source messages through the exact workspace client on its host loop."""
+        return await self.platform_actions.call_slack_api(workspace_id, method, **params)
 
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:
@@ -458,6 +505,7 @@ class PluginContext:
         self, name: str, toolset: str, schema: dict, handler: Callable,
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", override: bool = False,
+        *, model_visible: bool = True, deprecated: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry and track it as plugin-provided. ``override=True``
         replaces a same-named built-in (without it a name claimed by another toolset is rejected) and
@@ -485,6 +533,7 @@ class PluginContext:
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope,
+            model_visible=model_visible, deprecated=deprecated,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None
@@ -836,6 +885,20 @@ class PluginContext:
                              lambda: self._manager._remove_identity(handlers, entry))
         logger.debug("Plugin %s registered Slack action handler: %s", self.manifest.name, action_id)
         return handle
+
+    def register_slack_shortcut_handler(self, callback_id: str, callback: Callable) -> PluginRegistration:
+        """Register ``async handler(ack, body, *, client)`` for a Slack message shortcut.
+
+        ``body`` is the SDK-verified payload. ``client`` belongs to its exact workspace.
+        Unknown workspaces are acknowledged without invoking the plugin.
+        """
+        if not isinstance(callback_id, str) or not callback_id.strip() or not callable(callback):
+            raise self._refuse("an invalid Slack shortcut handler")
+        entry = (callback_id, callback, self.manifest.name)
+        handlers = self._manager._slack_shortcut_handlers
+        handlers.append(entry)
+        return self._track("slack_shortcut_handler", callback_id,
+                           lambda: self._manager._remove_identity(handlers, entry))
 
     def register_slack_event_handler(self, event_type: str, callback: Callable) -> PluginRegistration:
         """Register an SDK observer with additive event/body/client keyword fields."""
@@ -1217,8 +1280,13 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
         self._approval_transports: Dict[str, Any] = {}
         self._slack_action_handlers: List[tuple] = []
+        self._slack_shortcut_handlers: List[tuple] = []
         self._slack_event_handlers: List[tuple] = []
         self._cron_job_runners: List[tuple] = []
+        try:
+            self._task_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._task_loop = None
         self._platform_handler_factories: Dict[str, List[tuple]] = {}
         # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
         self._plugin_loaded_listeners: List[Callable] = []
@@ -1529,6 +1597,10 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """``(action_id, callback, plugin_name)`` tuples for the Slack adapter to wire at connect."""
         return list(self._slack_action_handlers)
 
+    def get_slack_shortcut_handlers(self) -> List[tuple]:
+        """Return this profile's active SDK shortcut registrations."""
+        return list(self._slack_shortcut_handlers)
+
     def get_platform_handler_factories(self, platform: str) -> List[tuple]:
         """``(factory, plugin_name)`` tuples for one platform; adapters call ``factory(native,
         adapter)`` at connect (see :meth:`PluginContext.register_platform_handler`)."""
@@ -1632,13 +1704,25 @@ def get_plugin_manager() -> PluginManager:
         # keyed cache doesn't know about at all.
         if _plugin_manager is not None and _plugin_manager not in _plugin_managers_by_home.values():
             _plugin_managers_by_home[current_home] = _plugin_manager
+            _bind_plugin_task_loop(_plugin_manager)
             return _plugin_manager
         manager = _plugin_managers_by_home.get(current_home)
         if manager is None:
             manager = PluginManager(scope_key=hermes_home_key(current_home))
             _plugin_managers_by_home[current_home] = manager
         _plugin_manager = manager
+        _bind_plugin_task_loop(manager)
         return manager
+
+
+def _bind_plugin_task_loop(manager: PluginManager) -> None:
+    """Remember only a live owning-profile async host; sync callers leave it untouched."""
+    if manager._task_loop is not None and not manager._task_loop.is_closed():
+        return
+    try:
+        manager._task_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
 
 
 def _reset_plugin_managers_for_tests() -> None:

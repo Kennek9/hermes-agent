@@ -6,6 +6,7 @@ Every verb returns a structured result dict — ``{"ok": True, ...}`` on success
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict
 
@@ -190,6 +191,73 @@ class PlatformActions:
             "set_thread_title", platform, chat_id, thread_id, title,
             chat_id=chat_id, thread_id=thread_id, title=title,
         )
+
+    async def send_message(
+        self, platform: str, chat_id: str, text: str, *,
+        reply_to: str | None = None, metadata: dict | None = None,
+    ) -> Dict[str, Any]:
+        """Deliver on the gateway loop so SDK clients never cross event loops."""
+        adapter, error = self._gate(platform, chat_id=chat_id, text=text)
+        if error is not None or adapter is None:
+            result = error or _err("gateway_unavailable")
+            self._audit("send_message", platform, result)
+            return result
+
+        async def deliver() -> Dict[str, Any]:
+            try:
+                if str(platform).strip().lower() == "slack":
+                    outcome = await adapter.send_plugin_message(
+                        chat_id, text, reply_to=reply_to, metadata=metadata,
+                    )
+                else:
+                    outcome = await adapter.send(
+                        chat_id, text, reply_to=reply_to, metadata=metadata,
+                    )
+                if not outcome.success:
+                    return _err("delivery_failed")
+                return _ok(action="send_message", message_id=outcome.message_id)
+            except Exception:
+                logger.warning("Plugin platform delivery failed for %s", self._plugin_id)
+                return _err("delivery_failed")
+
+        result = await self._on_gateway_loop(deliver)
+        self._audit("send_message", platform, result)
+        return result
+
+    async def _on_gateway_loop(self, operation) -> Dict[str, Any]:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        gateway_loop = getattr(runner, "_gateway_loop", None)
+        if gateway_loop is None or gateway_loop.is_closed() or not gateway_loop.is_running():
+            result = _err("gateway_unavailable")
+        elif asyncio.get_running_loop() is gateway_loop:
+            result = await operation()
+        else:
+            result = await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(operation(), gateway_loop))
+        return result
+
+    async def call_slack_api(self, workspace_id: str, method: str, **params) -> Dict[str, Any]:
+        """Bounded read-only Slack API surface for shortcut source-version checks."""
+        if method not in {"conversations.history", "conversations.replies", "conversations.info", "conversations.members", "users.info", "chat.getPermalink"}:
+            return _err("unsupported_platform_action")
+        adapter, error = self._gate("slack", workspace_id=workspace_id)
+        if error is not None or adapter is None:
+            return error or _err("gateway_unavailable")
+
+        async def read() -> Dict[str, Any]:
+            client = adapter._team_clients.get(workspace_id)
+            if client is None:
+                return _err("workspace_unavailable")
+            try:
+                response = await client.api_call(method, http_verb="GET", params=params)
+                return dict(response)
+            except Exception:
+                logger.warning("Plugin Slack source read failed for %s", self._plugin_id)
+                return _err("slack_api_failed")
+
+        result = await self._on_gateway_loop(read)
+        self._audit(method, "slack", result)
+        return result
 
     def _audit(self, verb: str, platform: str, result: Dict[str, Any]) -> None:
         """Every platform action is logged (the #64176 'all actions logged' rule)."""

@@ -313,6 +313,37 @@ async def _send_message(
     return await _send_items(session, base_url=base_url, token=token, to=to, item_list=item_list, context_token=context_token, client_id=client_id)
 
 
+async def send_text_message(*, chat_id: str, text: str, client_id: str) -> bool:
+    """Send literal worker receipts with this profile's credentials and peer context token.
+
+    This path deliberately does not parse MEDIA/file commands from untrusted source text.
+    Each chunk gets a stable id so retrying a worker receipt preserves send idempotency.
+    """
+    if not all(isinstance(value, str) and value.strip() for value in (chat_id, text, client_id)):
+        raise ValueError("chat_id, text and client_id must be non-empty strings")
+    if not AIOHTTP_AVAILABLE:
+        return False
+    account, token = _wx_secret("WEIXIN_ACCOUNT_ID", ""), _wx_secret("WEIXIN_TOKEN", "")
+    if not account or not token:
+        return False
+    base_url = _wx_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)
+    store = ContextTokenStore(str(get_hermes_home()))
+    store.restore(account)
+    async with _new_session() as session:
+        for offset in range(0, len(text), 3800):
+            chunk = text[offset:offset + 3800]
+            chunk_id = client_id + "-" + hashlib.sha256(
+                (str(offset) + ":" + chunk).encode("utf-8")
+            ).hexdigest()[:24]
+            result = await _send_message(
+                session, base_url=base_url, token=token, to=chat_id, text=chunk,
+                context_token=store.get(account, chat_id), client_id=chunk_id,
+            )
+            if result.get("ret", 0) != 0 or result.get("errcode", 0) != 0:
+                return False
+    return True
+
+
 async def _get_config(session: "aiohttp.ClientSession", *, base_url: str, token: str, user_id: str, context_token: Optional[str]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"ilink_user_id": user_id}
     if context_token:

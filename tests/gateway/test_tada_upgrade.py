@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 
-def test_installed_plugins_register_with_real_manager(tmp_path, monkeypatch):
+def test_installed_plugins_register_with_real_manager(tmp_path, monkeypatch, tada_release_plugin_parent):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.syspath_prepend(str(tada_release_plugin_parent))
     (tmp_path / 'plugins').mkdir()
     for name in ('company_knowledge_v1', 'table_workflows'):
-        (tmp_path / 'plugins' / name).symlink_to(Path('/home/ubuntu/.hermes/plugins') / name)
+        (tmp_path / 'plugins' / name).symlink_to(tada_release_plugin_parent / name)
     (tmp_path / 'config.yaml').write_text('plugins:\n  enabled: [company_knowledge_v1, table_workflows]\n')
     from hermes_cli.plugins import PluginManager
     manager = PluginManager(scope_key=str(tmp_path))
@@ -55,12 +56,17 @@ def test_native_transport_maps_tool_result_back_to_public_name():
 
 
 @pytest.mark.asyncio
-async def test_busy_weixin_intake_persists_before_agent_routing(tmp_path, monkeypatch):
+@pytest.mark.parametrize('locale,receipt', [
+    ('zh-CN', '已收到，等待后台处理'),
+    ('en-US', 'Received. Waiting for background processing.'),
+])
+async def test_busy_weixin_intake_persists_before_agent_routing(tmp_path, monkeypatch, tada_release_plugin_parent, locale, receipt):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('TADA_WEIXIN_COMPANY_SHARED', 'true')
     monkeypatch.setenv('TADA_WEIXIN_EMPLOYEE_ID', 'employee')
-    monkeypatch.syspath_prepend('/home/ubuntu/.hermes/plugins')
-    from company_knowledge_v1 import weixin, weixin_jobs
+    monkeypatch.syspath_prepend(str(tada_release_plugin_parent))
+    from company_knowledge_v1 import weixin, weixin_jobs, settings
+    settings.configure(SimpleNamespace(get_config=lambda key, default=None: locale if key == 'default_locale' else default))
     import hermes_cli.lifecycle
     from gateway.config import Platform
     from gateway.platforms.base import MessageEvent, MessageType
@@ -77,7 +83,7 @@ async def test_busy_weixin_intake_persists_before_agent_routing(tmp_path, monkey
     monkeypatch.setattr(hermes_cli.lifecycle,'invoke_hook',lambda name,**kw:[weixin.pre_gateway_dispatch(**kw)])
     assert await GatewayBusySessionMixin._handle_active_session_busy_message(runner,event,'session') is True
     assert adapter._send_with_retry.await_count == 1
-    assert adapter._send_with_retry.call_args.kwargs['content'] == '已收到，等待后台处理'
+    assert adapter._send_with_retry.call_args.kwargs['content'] == receipt
     import sqlite3
     with sqlite3.connect(weixin_jobs.job_database()) as connection:
         assert connection.execute('SELECT count(*) FROM jobs').fetchone()[0] == 1

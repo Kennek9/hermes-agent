@@ -1616,6 +1616,8 @@ class SlackAdapter(BasePlatformAdapter):
 
         def _listener_for(handler):
             async def _listener(event, say, body):
+                if event.get("type") != "app_home_opened":
+                    await self._dispatch_plugin_slack_event(event, body)
                 await handler(event, body)
 
             return _listener
@@ -1660,6 +1662,13 @@ class SlackAdapter(BasePlatformAdapter):
         # deliver undeclared commands at all.
         from hermes_cli.commands_platforms import slack_native_slashes
         _slash_names = [name for name, _d, _h in slack_native_slashes()]
+        # The generated manifest is capped at Slack's 50 commands. Operators can
+        # declare a plugin slash explicitly, so the listener must not inherit that cap.
+        from hermes_cli.plugins import get_plugin_commands
+        _slash_names = list(dict.fromkeys([
+            *_slash_names,
+            *(name for name in get_plugin_commands() if re.fullmatch(r"[a-z0-9_-]{1,32}", name)),
+        ]))
         if _slash_names:
             _slash_pattern = re.compile(
                 r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
@@ -1687,6 +1696,7 @@ class SlackAdapter(BasePlatformAdapter):
         for _action_id in _MODEL_PICKER_ACTION_IDS:
             self._app.action(_action_id)(self._handle_model_picker_action)
         self._register_plugin_action_handlers()
+        self._register_plugin_shortcut_handlers()
         # ctx.register_platform_handler("slack", ...) factories get the full
         # AsyncApp surface (event/action/command), wired before Socket Mode starts.
         self._wire_plugin_handlers(self._app)
@@ -1736,11 +1746,49 @@ class SlackAdapter(BasePlatformAdapter):
     _plugin_actions_app: Any = None
     _plugin_actions_wired: set = frozenset()
 
+    def _register_plugin_shortcut_handlers(self) -> None:
+        """Wire profile-owned shortcuts; unloaded callbacks never run from stale SDK listeners."""
+        from hermes_cli.plugins import get_plugin_manager
+        if self._plugin_shortcuts_app is not self._app:
+            self._plugin_shortcuts_app, self._plugin_shortcuts_wired = self._app, set()
+        manager = get_plugin_manager()
+
+        def listener(callback_id, owner):
+            async def invoke(ack, body):
+                entries = get_plugin_manager().get_slack_shortcut_handlers()
+                callback = next((cb for key, cb, name in reversed(entries) if key == callback_id and name == owner), None)
+                if callback is None:
+                    await ack()
+                    return
+                team = self._event_team_id(body)
+                client = self._team_clients.get(team)
+                if not team or client is None:
+                    await ack()
+                    return
+                try:
+                    result = callback(ack, body, client=client)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.warning("[Slack] Plugin shortcut failed: %s", owner)
+                    await ack()
+            return invoke
+
+        for callback_id, callback, owner in manager.get_slack_shortcut_handlers():
+            key = (callback_id, owner)
+            if key not in self._plugin_shortcuts_wired:
+                self._app.shortcut(callback_id)(listener(callback_id, owner))
+                self._plugin_shortcuts_wired.add(key)
+
+    _plugin_shortcuts_app: Any = None
+    _plugin_shortcuts_wired: set = frozenset()
+
     def rewire_plugin_handlers(self) -> None:
         """Late plugin loads carry both registries: action handlers and ``register_platform_handler``
         factories (base). Both are per-app idempotent."""
         if self._app is not None and self._plugin_actions_app is self._app:
             self._register_plugin_action_handlers()
+            self._register_plugin_shortcut_handlers()
         super().rewire_plugin_handlers()
 
     @staticmethod
@@ -2212,6 +2260,49 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
                 return await getattr(client_fn(), method)(**retry_kwargs)
             raise
+
+    async def send_plugin_message(
+        self, chat_id: str, content: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send plugin content with an explicit workspace and no primary-client fallback."""
+        blocked = self._outbound_blocked(chat_id, "plugin send to")
+        if blocked:
+            return blocked
+        metadata = dict(metadata or {})
+        team_id = metadata.get("workspace_id")
+        if not isinstance(team_id, str) or not team_id:
+            return SendResult(success=False, error="workspace_required")
+        if any(metadata.get(key) not in (None, "", team_id) for key in (
+            "scope_id", "slack_team_id", "team_id", "team", "guild_id",
+        )):
+            return SendResult(success=False, error="workspace_mismatch")
+        client = self._team_clients.get(team_id)
+        if client is None:
+            return SendResult(success=False, error="workspace_unavailable")
+        # The plugin supplies an existing conversation, not a bare user id requiring a
+        # conversations.open fallback. Gateway session context already carries this channel.
+        if not isinstance(chat_id, str) or not chat_id.startswith(("C", "D", "G")):
+            return SendResult(success=False, error="conversation_required")
+        blocks = metadata.get("blocks")
+        if blocks is not None and (not isinstance(blocks, list) or len(blocks) > 50):
+            return SendResult(success=False, error="invalid_blocks")
+        payload: Dict[str, Any] = {"channel": chat_id, "text": content}
+        if blocks is not None:
+            payload["blocks"] = sanitize_blocks(blocks)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        try:
+            response = await client.chat_postMessage(**payload)
+        except Exception:
+            logger.warning("[Slack] Plugin message delivery failed")
+            return SendResult(success=False, error="delivery_failed")
+        sent_ts = response.get("ts")
+        if sent_ts:
+            self._bot_message_ts.add(self._workspace_message_marker(team_id, sent_ts))
+            self._trim_bot_message_timestamps()
+        return SendResult(success=bool(response.get("ok", False)), message_id=sent_ts)
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,

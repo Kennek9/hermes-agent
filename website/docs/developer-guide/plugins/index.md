@@ -9,6 +9,9 @@ description: "Step-by-step guide to building a complete Hermes plugin with tools
 
 This guide walks through building a complete Hermes plugin from scratch. By the end you'll have a working plugin with multiple tools, lifecycle hooks, shipped data files, and a bundled skill — everything the plugin system supports.
 
+For trusted gateway context, supervised background work and workspace-scoped Slack
+interactions, see [Gateway runtime contracts](./gateway-runtime-contracts.md).
+
 :::info Not sure which guide you need?
 Hermes has several distinct pluggable interfaces — some use Python `register_*` APIs, others are config-driven or drop-in directories. Use this map first:
 
