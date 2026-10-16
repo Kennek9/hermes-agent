@@ -15,6 +15,10 @@ from typing import Any
 
 from hermes_cli.approval_transport import ApprovalDecision, ApprovalRequest
 from hermes_constants import get_hermes_home
+from tools.interrupt import (
+    acting_for_tid, capture_interrupt_checkpoint, interrupt_checkpoint_changed,
+    run_if_interrupt_checkpoint_unchanged,
+)
 
 _NONCE = re.compile(r"[A-Za-z0-9_-]{43}")
 _LOCK = threading.RLock()
@@ -76,6 +80,7 @@ class PendingConfirmation:
     future: asyncio.Future
     adapter: Any
     labels: dict[str, str]
+    interrupt_checkpoint: tuple[tuple[int, int], ...]
     card_message_id: str = ""
     consumed: bool = False
 
@@ -85,10 +90,11 @@ class PendingConfirmation:
             if (self.consumed or self.future.done() or time.monotonic() >= self.deadline
                     or choice not in {"once", "deny"} or _PENDING.get(self.nonce) is not self):
                 return False
-            self.consumed = True
-            decision = self.request.respond(choice)
-            self.future.get_loop().call_soon_threadsafe(_deliver, self.future, decision)
-            return True
+            def commit() -> None:
+                self.consumed = True
+                decision = self.request.respond(choice)
+                self.future.get_loop().call_soon_threadsafe(_deliver, self.future, decision)
+            return run_if_interrupt_checkpoint_unchanged(self.interrupt_checkpoint, commit)
 
 
 def _deliver(future: asyncio.Future, decision: ApprovalDecision) -> None:
@@ -107,6 +113,9 @@ def _retire(entry: PendingConfirmation) -> None:
 
 async def request_confirmation(ctx, summary: str, payload: dict, *, locale: str, timeout_seconds: float) -> dict:
     """Present only native human UI. YOLO, smart approval and allowlists never grant consent."""
+    checkpoint = capture_interrupt_checkpoint((threading.get_ident(), acting_for_tid.get()))
+    if interrupt_checkpoint_changed(checkpoint):
+        return {"status": "cancelled", "error": "confirmation_cancelled"}
     if not isinstance(summary, str) or not summary.strip() or len(summary) > 4000 or not isinstance(payload, dict):
         return {"status": "unavailable", "error": "invalid_confirmation_request"}
     if not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 300:
@@ -123,6 +132,8 @@ async def request_confirmation(ctx, summary: str, payload: dict, *, locale: str,
     if error is not None or adapter is None:
         return {"status": "unavailable", "error": (error or {}).get("error", "platform_unavailable")}
     labels = messages(locale)
+    if interrupt_checkpoint_changed(checkpoint):
+        return {"status": "cancelled", "error": "confirmation_cancelled"}
     approval = ApprovalRequest.create(
         command=summary, description=labels["description"], pattern_key="plugin_confirmation:" + digest,
         pattern_keys=("plugin_confirmation:" + digest,), session_key=context.session_key,
@@ -134,6 +145,7 @@ async def request_confirmation(ctx, summary: str, payload: dict, *, locale: str,
             nonce=secrets.token_urlsafe(32), plugin_id=ctx.plugin_id, context=context,
             request=approval, payload_digest=digest, deadline=time.monotonic() + timeout_seconds,
             future=asyncio.get_running_loop().create_future(), adapter=adapter, labels=labels,
+            interrupt_checkpoint=checkpoint,
         )
         with _LOCK:
             if len(_PENDING) >= _MAX_PENDING:
@@ -147,7 +159,7 @@ async def request_confirmation(ctx, summary: str, payload: dict, *, locale: str,
             )},
         }
         try:
-            sent = await adapter.send_plugin_confirmation(entry)
+            sent = await _wait_for_stage(asyncio.create_task(adapter.send_plugin_confirmation(entry)), entry)
             if not sent or not sent.success:
                 return {**receipt, "status": "unavailable", "error": "confirmation_delivery_failed"}
             entry.card_message_id = str(sent.message_id or "")
@@ -156,25 +168,45 @@ async def request_confirmation(ctx, summary: str, payload: dict, *, locale: str,
             from tools.approval_human_wait import activity_heartbeat, human_wait_window
             heartbeat = activity_heartbeat("waiting for plugin confirmation")
             with human_wait_window(context.session_key):
-                while not entry.future.done():
-                    remaining = entry.deadline - time.monotonic()
-                    if remaining <= 0:
-                        return {**receipt, "status": "expired"}
-                    try:
-                        await asyncio.wait_for(asyncio.shield(entry.future), min(1.0, remaining))
-                    except asyncio.TimeoutError:
-                        heartbeat()
-            decision = entry.future.result()
+                decision = await _wait_for_stage(entry.future, entry, heartbeat=heartbeat)
             if (not isinstance(decision, ApprovalDecision) or decision.request_id != approval.request_id
                     or decision.request_digest != approval.digest or decision.choice not in approval.allowed_choices
                     or payload_digest(payload) != digest):
                 return {**receipt, "status": "denied", "error": "confirmation_binding_mismatch"}
             return {**receipt, "status": "approved" if decision.choice == "once" else "denied"}
+        except _RequestEnded as ended:
+            return {**receipt, "status": ended.status, "error": "confirmation_" + ended.status}
         finally:
             handle.dispose()
 
     result = await ctx.platform_actions._on_gateway_loop(present_and_wait)
+    if interrupt_checkpoint_changed(checkpoint):
+        return {**result, "status": "cancelled", "error": "confirmation_cancelled"}
     return result if "status" in result else {"status": "unavailable", "error": result.get("error", "platform_unavailable")}
+
+
+class _RequestEnded(Exception):
+    def __init__(self, status: str):
+        self.status = status
+
+
+async def _wait_for_stage(task: asyncio.Future, entry: PendingConfirmation, *, heartbeat=lambda: None):
+    """Bound delivery and human wait by one deadline and the original worker's cancellation."""
+    try:
+        while True:
+            if interrupt_checkpoint_changed(entry.interrupt_checkpoint):
+                raise _RequestEnded("cancelled")
+            remaining = entry.deadline - time.monotonic()
+            if remaining <= 0:
+                raise _RequestEnded("expired")
+            if task.done():
+                return task.result()
+            await asyncio.wait({task}, timeout=min(0.1, remaining))
+            heartbeat()
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 def resolve_feishu_card(adapter, event, value: dict) -> dict[str, str] | None:
@@ -188,7 +220,8 @@ def resolve_feishu_card(adapter, event, value: dict) -> dict[str, str] | None:
             return None
         operator, callback = getattr(event, "operator", None), getattr(event, "context", None)
         identifiers = {str(getattr(operator, field, "") or "") for field in ("user_id", "open_id")}
-        if (entry.context.user_id not in identifiers
+        if (not adapter._is_interactive_operator_authorized(str(getattr(operator, "open_id", "") or ""))
+                or entry.context.user_id not in identifiers
                 or str(getattr(callback, "open_chat_id", "") or "") != entry.context.chat_id
                 or not entry.card_message_id
                 or str(getattr(callback, "open_message_id", "") or "") != entry.card_message_id):

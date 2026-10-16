@@ -1776,7 +1776,11 @@ class FeishuAdapter(BasePlatformAdapter):
             payload=json.dumps(card, ensure_ascii=False), reply_to=confirmation.context.message_id,
             metadata={"thread_id": confirmation.context.thread_id},
         )
-        return self._finalize_send_result(response, "Plugin confirmation delivery failed")
+        result = self._finalize_send_result(response, "Plugin confirmation delivery failed")
+        if result.success:
+            # Arm the exact card id before another task can observe send completion.
+            confirmation.card_message_id = str(result.message_id or "")
+        return result
 
     async def _send_interactive_card(
         self, chat_id: str, card: Dict[str, Any], metadata: Optional[Dict[str, Any]], failure_message: str, *,

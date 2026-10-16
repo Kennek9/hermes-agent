@@ -456,7 +456,17 @@ class PluginContext:
     def run_async(self, awaitable):
         """Run async work from a synchronous handler using Hermes' scoped async bridge."""
         from model_tools import _run_async
-        return _run_async(awaitable)
+        from tools.interrupt import acting_for_tid
+        token = acting_for_tid.set(acting_for_tid.get() or threading.get_ident())
+        try:
+            return _run_async(awaitable)
+        finally:
+            acting_for_tid.reset(token)
+
+    def is_interrupted(self) -> bool:
+        """Read cancellation for the current tool worker and any original worker it acts for."""
+        from tools.interrupt import is_interrupted
+        return is_interrupted()
 
     async def send_platform_message(
         self, platform: str, chat_id: str, text: str, *,

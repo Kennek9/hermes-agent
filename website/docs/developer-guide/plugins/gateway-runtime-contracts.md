@@ -69,6 +69,9 @@ The result contains a host-generated `request_id`, `payload_digest`, trusted `co
 and `status`; only `status="approved"` permits the caller to revalidate its own current
 business authorization. Denial, timeout, delivery failure and changed payloads never
 authorize a write.
+The request observes the original tool worker's `/stop` signal across async loops.
+A cleared interrupt bit cannot revive an older request. Consumers also call
+`ctx.is_interrupted()` immediately before dispatching an approved write.
 
 Callers that own a private connector policy can use
 `tools.mcp_isolated.IsolatedMCPClient(name, stderr=None, follow_redirects=False)`.
@@ -78,3 +81,5 @@ The connection never publishes schemas into the user's registry, never replaces 
 explicit endpoint from profile config, and never automatically replays a dispatched
 tool call. The caller still owns its tool allowlist, argument validation and write
 authorization. Provider stderr is discarded by default.
+OAuth additionally requires an explicit `oauth_home` owned by that connection. It
+never inherits a same-named provider or token from the user's active Hermes profile.

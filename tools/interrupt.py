@@ -22,6 +22,8 @@ if _DEBUG_INTERRUPT:
 # Interrupted thread idents + optional user-safe cause (never the user's message text).
 _interrupted_threads: set[int] = set()
 _interrupt_reasons: dict[int, str] = {}
+# A cleared bit must not revive an older approval waiter on the same worker.
+_interrupt_generations: dict[int, int] = {}
 # Threads asked to YIELD: hand a long-running foreground command to the background
 # instead of killing it, so a mid-turn user message is not parked behind it.
 _yield_threads: set[int] = set()
@@ -40,6 +42,8 @@ def set_interrupt(active: bool, thread_id: int | None = None, *, reason: str | N
     tid = thread_id if thread_id is not None else threading.current_thread().ident
     with _lock:
         (_interrupted_threads.add if active else _interrupted_threads.discard)(tid)
+        if active:
+            _interrupt_generations[tid] = _interrupt_generations.get(tid, 0) + 1
         if active and reason:
             _interrupt_reasons[tid] = reason
         else:
@@ -69,6 +73,28 @@ def is_thread_interrupted(thread_id: int | None) -> bool:
         return False
     with _lock:
         return thread_id in _interrupted_threads
+
+
+def capture_interrupt_checkpoint(thread_ids) -> tuple[tuple[int, int], ...]:
+    """Snapshot original tool-worker generations before an async wait changes threads."""
+    with _lock:
+        return tuple((tid, _interrupt_generations.get(tid, 0)) for tid in set(thread_ids) if tid is not None)
+
+
+def interrupt_checkpoint_changed(checkpoint: tuple[tuple[int, int], ...]) -> bool:
+    with _lock:
+        return any(tid in _interrupted_threads or _interrupt_generations.get(tid, 0) != generation
+                   for tid, generation in checkpoint)
+
+
+def run_if_interrupt_checkpoint_unchanged(checkpoint, callback: Callable[[], None]) -> bool:
+    """Arbitrate an approval decision against /stop using the existing interrupt lock."""
+    with _lock:
+        if any(tid in _interrupted_threads or _interrupt_generations.get(tid, 0) != generation
+               for tid, generation in checkpoint):
+            return False
+        callback()
+        return True
 
 
 def request_yield(thread_id: int) -> None:

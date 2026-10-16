@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.platforms.feishu.adapter import FeishuAdapter
 from gateway.platforms.weixin import WeixinAdapter
+from tools.interrupt import set_interrupt
 
 
 @pytest.fixture
@@ -62,7 +64,7 @@ def sdk_click(nonce, *, user="requester", chat="chat-a", message="card-a", choic
     }})
 
 
-async def feishu_request(native, monkeypatch, *, payload=None, timeout=5, locale="en-US"):
+async def feishu_request(native, monkeypatch, *, payload=None, timeout=5, locale="en-US", caller_tids=None, nested_loop=False):
     import gateway.run
 
     home, manager, ctx = native
@@ -79,13 +81,26 @@ async def feishu_request(native, monkeypatch, *, payload=None, timeout=5, locale
 
     adapter._feishu_send_with_retry = send
     monkeypatch.setattr(ctx.platform_actions, "_resolve_adapter", lambda _platform: (adapter, None))
-    monkeypatch.setattr(gateway.run, "_gateway_runner_ref", lambda: SimpleNamespace(_gateway_loop=asyncio.get_running_loop()))
+    host_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(gateway.run, "_gateway_runner_ref", lambda: SimpleNamespace(_gateway_loop=host_loop))
     tokens = bind()
     try:
-        task = asyncio.create_task(ctx.request_confirmation(
-            "Flag document A as outdated", payload or {"target": "document-a", "state": "outdated"},
-            timeout_seconds=timeout, locale=locale,
-        ))
+        def request():
+            return ctx.request_confirmation(
+                "Flag document A as outdated", payload or {"target": "document-a", "state": "outdated"},
+                timeout_seconds=timeout, locale=locale,
+            )
+        if caller_tids is None:
+            task = asyncio.create_task(request())
+        else:
+            def invoke():
+                caller_tids.append(threading.get_ident())
+                if nested_loop:
+                    async def inner():
+                        return ctx.run_async(request())
+                    return asyncio.run(inner())
+                return ctx.run_async(request())
+            task = asyncio.create_task(asyncio.to_thread(invoke))
     finally:
         clear_session_vars(tokens)
     await asyncio.wait_for(published.wait(), 5)
@@ -219,3 +234,65 @@ async def test_unload_denies_pending_request_and_foreign_context_cannot_present(
     finally:
         clear_session_vars(tokens)
         reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested_loop", [False, True])
+@pytest.mark.parametrize("clear_before_poll", [False, True])
+async def test_original_tool_stop_permanently_retires_card_across_loops(native, monkeypatch, nested_loop, clear_before_poll):
+    caller_tids = []
+    adapter, task, nonce, *_ = await feishu_request(
+        native, monkeypatch, caller_tids=caller_tids, nested_loop=nested_loop,
+    )
+    try:
+        set_interrupt(True, caller_tids[0], reason="user stop")
+        if clear_before_poll:
+            set_interrupt(False, caller_tids[0])
+        receipt = await asyncio.wait_for(task, 1)
+        assert receipt["status"] == "cancelled"
+        assert nonce not in plugin_confirmation._PENDING
+        assert not plugin_confirmation.resolve_feishu_card(adapter, sdk_click(nonce).event, sdk_click(nonce).event.action.value)
+    finally:
+        set_interrupt(False, caller_tids[0])
+
+
+@pytest.mark.asyncio
+async def test_feishu_platform_revocation_blocks_old_card(native, monkeypatch):
+    adapter, task, nonce, *_ = await feishu_request(native, monkeypatch)
+    adapter._admins = {"another-admin"}
+    assert not adapter._is_interactive_operator_authorized("ou-requester")
+    adapter._on_card_action_trigger(sdk_click(nonce))
+    await asyncio.sleep(0)
+    assert not task.done()
+    adapter._admins = {"ou-requester"}
+    adapter._on_card_action_trigger(sdk_click(nonce))
+    assert (await task)["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_total_deadline_cancels_weixin_send_gate_wait(native, monkeypatch):
+    import gateway.run
+    import gateway.platforms.weixin as weixin_module
+
+    home, manager, ctx = native
+    adapter = WeixinAdapter(PlatformConfig(enabled=False))
+    adapter._send_session, adapter._token = object(), "synthetic-token"
+    dispatch = AsyncMock(side_effect=AssertionError("An expired confirmation must not be sent later"))
+    monkeypatch.setattr(weixin_module, "_send_message", dispatch)
+    host_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(ctx.platform_actions, "_resolve_adapter", lambda _platform: (adapter, None))
+    monkeypatch.setattr(gateway.run, "_gateway_runner_ref", lambda: SimpleNamespace(_gateway_loop=host_loop))
+    await adapter._send_text_gate.acquire()
+    tokens = bind("weixin")
+    try:
+        task = asyncio.create_task(ctx.request_confirmation("Confirm", {"target": "a"}, timeout_seconds=0.02))
+    finally:
+        clear_session_vars(tokens)
+    try:
+        receipt = await asyncio.wait_for(task, 0.2)
+        assert receipt["status"] == "expired"
+        assert not any(entry.context.session_key == "session-a" for entry in plugin_confirmation._PENDING.values())
+    finally:
+        adapter._send_text_gate.release()
+    await asyncio.sleep(0.05)
+    dispatch.assert_not_awaited()
