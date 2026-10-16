@@ -400,8 +400,10 @@ async def test_sdk_maintenance_reaches_only_revocation_when_chat_actor_is_unauth
     calls = []
 
     def runner(module, request):
-        assert module == "company_docs_mcp.slack_authority_bridge"
+        assert module == "company_docs_mcp.transport.slack_authority_bridge"
         assert request["operation"] == "revoke"
+        assert request["protocol_version"] == 2
+        assert request["workspace_id"] == request["token_workspace_id"] == "T_A"
         calls.append(request)
         return {"ok": True, "data": {}}
 
@@ -414,7 +416,7 @@ async def test_sdk_maintenance_reaches_only_revocation_when_chat_actor_is_unauth
     monkeypatch.setattr(
         authority,
         "_api",
-        AsyncMock(return_value={"ok": True, "team_id": "T_A", "user_id": "U_BOT"}),
+        AsyncMock(side_effect=AssertionError("Revocation must not wait for a Slack API probe")),
     )
     authority.register(context(manager))
     adapter = SlackAdapter(PlatformConfig(enabled=False))

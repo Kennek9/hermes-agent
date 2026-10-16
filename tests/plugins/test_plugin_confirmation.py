@@ -41,6 +41,7 @@ def native(tmp_path, monkeypatch):
     manager = PluginManager(scope_key=str(home))
     ctx = PluginContext(PluginManifest(name="confirm-consumer", source="user"), manager)
     monkeypatch.setattr(ctx.platform_actions, "_capability_granted", lambda: True)
+    monkeypatch.setattr("tools.approval._YOLO_MODE_FROZEN", True)
     # A separate policy gate must never silently convert this operation into approval.
     monkeypatch.setattr("tools.approval.request_tool_approval", lambda *_a, **_k: pytest.fail("execution policy is not human confirmation"))
     yield home, manager, ctx
