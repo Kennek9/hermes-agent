@@ -483,6 +483,13 @@ class PluginContext:
             workspace_id, channel_id, thread_ts, status,
         )
 
+    async def request_confirmation(
+        self, summary: str, payload: dict, *, locale: str = "en-US", timeout_seconds: float = 120,
+    ) -> dict:
+        """Require one correlated human decision; execution auto-approval settings never apply."""
+        from hermes_cli.plugin_confirmation import request_confirmation
+        return await request_confirmation(self, summary, payload, locale=locale, timeout_seconds=timeout_seconds)
+
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:
         <name>`` selects it. It receives a redacted ``ApprovalRequest`` and returns only a

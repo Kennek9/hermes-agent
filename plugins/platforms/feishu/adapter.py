@@ -1761,6 +1761,23 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def send_plugin_confirmation(self, confirmation) -> SendResult:
+        """Present a one-use native card for the host's exact plugin request."""
+        labels = confirmation.labels
+        actions = [
+            _card_button(labels[key], style, {
+                "hermes_plugin_confirmation": confirmation.nonce, "choice": choice,
+            }) for key, choice, style in (("approve", "once", "primary"), ("deny", "deny", "danger"))
+        ]
+        expiry = labels["expires"].format(seconds=f"{confirmation.request.timeout_seconds:g}")
+        card = _card(labels["title"], "orange", confirmation.request.command + "\n\n" + labels["description"] + "\n" + expiry, actions=actions)
+        response = await self._feishu_send_with_retry(
+            chat_id=confirmation.context.chat_id, msg_type="interactive",
+            payload=json.dumps(card, ensure_ascii=False), reply_to=confirmation.context.message_id,
+            metadata={"thread_id": confirmation.context.thread_id},
+        )
+        return self._finalize_send_result(response, "Plugin confirmation delivery failed")
+
     async def _send_interactive_card(
         self, chat_id: str, card: Dict[str, Any], metadata: Optional[Dict[str, Any]], failure_message: str, *,
         state_map: Dict[int, Dict[str, str]], state_id: int, session_key: str,
@@ -2332,6 +2349,12 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         if isinstance(action_value, dict):
+            if "hermes_plugin_confirmation" in action_value:
+                from hermes_cli.plugin_confirmation import resolve_feishu_card
+                resolved = resolve_feishu_card(self, event, action_value)
+                if resolved is not None:
+                    return self._card_response(_card(resolved["title"], resolved["color"], resolved["text"]))
+                return self._card_response()
             if action_value.get("hermes_action"):
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
             if action_value.get("hermes_update_prompt_action"):

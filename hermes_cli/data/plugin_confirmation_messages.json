@@ -1,0 +1,26 @@
+{
+  "en-US": {
+    "title": "Confirm this operation",
+    "approve": "Confirm once",
+    "deny": "Cancel",
+    "description": "Only the requester can confirm this exact operation. Silence does not approve it.",
+    "commands": "Confirm with {approve}\nCancel with {deny}",
+    "approved": "Confirmation received. The operation will recheck your permissions before continuing.",
+    "denied": "Cancelled. The operation was not approved.",
+    "expired": "This confirmation has expired or was already used. Request a new preview.",
+    "mismatch": "This confirmation belongs to a different requester or conversation.",
+    "expires": "This confirmation expires within {seconds} seconds."
+  },
+  "zh-CN": {
+    "title": "确认本次操作",
+    "approve": "仅确认本次",
+    "deny": "取消",
+    "description": "只有发起人可以确认这一项操作。不回复不会批准操作。",
+    "commands": "确认请发送 {approve}\n取消请发送 {deny}",
+    "approved": "已收到确认。系统将在继续操作前重新检查你的权限。",
+    "denied": "已取消，操作未获批准。",
+    "expired": "这次确认已过期或已使用，请重新生成预览。",
+    "mismatch": "这次确认属于其他发起人或会话。",
+    "expires": "本次确认最多保留 {seconds} 秒。"
+  }
+}

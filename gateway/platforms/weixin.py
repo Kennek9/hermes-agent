@@ -1055,6 +1055,27 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             assert last_error is not None
             raise last_error
 
+    async def send_plugin_confirmation(self, confirmation) -> SendResult:
+        """Send an exact text preview; source text must never trigger MEDIA/file delivery."""
+        if not self._send_session or not self._token:
+            return SendResult(success=False, error="Not connected")
+        labels = confirmation.labels
+        commands = labels["commands"].format(approve="/approve " + confirmation.nonce, deny="/deny " + confirmation.nonce)
+        expiry = labels["expires"].format(seconds=f"{confirmation.request.timeout_seconds:g}")
+        content = confirmation.request.command + "\n\n" + labels["description"] + "\n" + expiry + "\n\n" + commands
+        chat_id = confirmation.context.chat_id
+        context_token = self._token_store.get(self._account_id, chat_id)
+        last_id = None
+        try:
+            for offset in range(0, len(content), 3800):
+                last_id = f"hermes-confirm-{confirmation.request.request_id}-{offset}"
+                await self._send_text_chunk(chat_id=chat_id, chunk=content[offset:offset + 3800],
+                                            context_token=context_token, client_id=last_id)
+        except Exception:
+            logger.warning("Weixin plugin confirmation delivery failed")
+            return SendResult(success=False, error="confirmation_delivery_failed")
+        return SendResult(success=True, message_id=last_id)
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")

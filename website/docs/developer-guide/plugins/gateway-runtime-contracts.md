@@ -56,3 +56,25 @@ Independent Weixin workers may call
 `await gateway.platforms.weixin.send_text_message(chat_id=..., text=..., client_id=...)`.
 It sends literal text, restores the profile account's peer context token and preserves
 chunk idempotency. It never interprets source text as file or MEDIA instructions.
+
+For an explicit business mutation, use
+`await ctx.request_confirmation(summary, payload, locale="en-US", timeout_seconds=120)`.
+The host reads requester, profile, chat, message and session from trusted ContextVars.
+Feishu presents a native interactive card. Weixin presents `/approve <nonce>` and
+`/deny <nonce>` through the existing native control-command path. Only the exact
+requester and conversation may answer. The host binds one nonce to the payload digest,
+expires it and consumes it once. A restart invalidates outstanding confirmations.
+Execution YOLO, smart approval, session grants and permanent grants do not apply.
+The result contains a host-generated `request_id`, `payload_digest`, trusted `context`
+and `status`; only `status="approved"` permits the caller to revalidate its own current
+business authorization. Denial, timeout, delivery failure and changed payloads never
+authorize a write.
+
+Callers that own a private connector policy can use
+`tools.mcp_isolated.IsolatedMCPClient(name, stderr=None, follow_redirects=False)`.
+Its public lifecycle is `await start(config)`, `discovered_tools()`,
+`await call_tool(name, arguments, timeout=...)`, and `await close()`.
+The connection never publishes schemas into the user's registry, never replaces its
+explicit endpoint from profile config, and never automatically replays a dispatched
+tool call. The caller still owns its tool allowlist, argument validation and write
+authorization. Provider stderr is discarded by default.

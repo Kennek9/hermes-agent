@@ -1218,6 +1218,10 @@ class GatewayInboundMixin:
         Only events that may control the gateway (``allow_gateway_control``) can answer them."""
         if not event.allow_gateway_control:
             return None
+        from hermes_cli.plugin_confirmation import resolve_native_command
+        confirmation_reply = resolve_native_command(event)
+        if confirmation_reply is not None:
+            return confirmation_reply
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
             _reply = await self._hm_clarify_reply(event, source, _quick_key)
