@@ -69,8 +69,8 @@ def _enable(monkeypatch, *names, disabled=()):
     """
     import hermes_cli.plugins as hp
 
-    monkeypatch.setattr(hp, "_get_enabled_plugins", lambda: set(names))
-    monkeypatch.setattr(hp, "_get_disabled_plugins", lambda: set(disabled))
+    monkeypatch.setattr(hp, "_get_enabled_plugins", lambda *, config_snapshot=None: set(names))
+    monkeypatch.setattr(hp, "_get_disabled_plugins", lambda *, config_snapshot=None: set(disabled))
 
 
 class _FakeEntryPoints:

@@ -79,7 +79,7 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     return set(load_env_file(path))
 
 
-def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
+def _clear_known_keys_missing_from_dotenv(path: Path, *, text: str | None = None) -> None:
     """After ``.env`` loaded with override, delete inherited ``_PROFILE_MANAGED_ENV_KEYS`` it does not
     define. Deliberately NARROW: only keys that change *which provider path* is used.
 
@@ -88,7 +88,11 @@ def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
     """
     if not path.exists():
         return
-    defined = _env_keys_defined_in_dotenv(path)
+    if text is None:
+        defined = _env_keys_defined_in_dotenv(path)
+    else:
+        from agent.secret_scope import _parse_env_text
+        defined = set(_parse_env_text(text))
     for key in _PROFILE_MANAGED_ENV_KEYS:
         if key not in defined and key in os.environ:
             del os.environ[key]
@@ -229,7 +233,7 @@ def _format_offending_chars(value: str, limit: int = 3) -> str:
     return ", ".join(seen)
 
 
-def _sanitize_loaded_credentials() -> None:
+def _sanitize_loaded_credentials(*, warn: bool = True) -> None:
     """Strip non-ASCII from credential env vars (``_CREDENTIAL_SUFFIXES``) so the codebase never sees them.
 
     Emits a one-line warning to stderr when characters are stripped. Silent stripping would mask copy-paste
@@ -243,7 +247,7 @@ def _sanitize_loaded_credentials() -> None:
             continue
         cleaned = value.encode("ascii", errors="ignore").decode("ascii")
         os.environ[key] = cleaned
-        if key in _WARNED_KEYS:
+        if not warn or key in _WARNED_KEYS:
             continue
         _WARNED_KEYS.add(key)
         stripped = len(value) - len(cleaned)
@@ -262,7 +266,10 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(path: Path, *, override: bool, load_pass: int | None = None) -> None:
+def _load_dotenv_with_fallback(
+    path: Path, *, override: bool, load_pass: int | None = None,
+    text: str | None = None, warn: bool = True,
+) -> str:
     """Load one dotenv file into ``os.environ`` like ``dotenv.load_dotenv`` — same parser, same
     ``${VAR}`` / ``${VAR:-default}`` / precedence rules — except that ``${VAR}`` resolves against the value
     VAR had before this process's earlier passes published it (see ``_DOTENV_PUBLISHED``).
@@ -270,21 +277,28 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool, load_pass: int | N
     ``load_pass`` groups the layered files of one ``load_hermes_dotenv`` call: within a pass a later layer
     (project, managed) still sees the earlier layer's output, as it always did; only OTHER passes' output
     is peeled. A bare call (``hermes send``'s direct reload) is its own pass."""
-    raw = path.read_bytes()
-    try:
-        # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
-        # first key name and silently drop it from os.environ under its canonical name.
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        if raw.startswith(codecs.BOM_UTF8):  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
-            raw = raw[len(codecs.BOM_UTF8) :]
-        text = raw.decode("latin-1")
+    if text is None:
+        raw = path.read_bytes()
+        try:
+            # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
+            # first key name and silently drop it from os.environ under its canonical name.
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            if raw.startswith(codecs.BOM_UTF8):  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
+                raw = raw[len(codecs.BOM_UTF8) :]
+            text = raw.decode("latin-1")
     # Imported here, not at module level: gateway tests stub ``sys.modules["dotenv"]`` with a bare module
     # exposing only ``load_dotenv``, and ``gateway.run`` imports this module at import time.
     from dotenv.main import DotEnv
     from dotenv.variables import parse_variables
 
-    assignments = list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
+    if warn:
+        assignments = list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
+    else:
+        # Same python-dotenv parser as DotEnv.parse(), without its log-writing
+        # with_warn_for_invalid_lines wrapper. Invalid bindings still stay skipped.
+        from dotenv.parser import parse_stream
+        assignments = [(binding.key, binding.value) for binding in parse_stream(io.StringIO(text)) if binding.key is not None]
 
     with _DOTENV_LOCK:
         if load_pass is None:
@@ -314,13 +328,16 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool, load_pass: int | N
             baseline = record[0] if ours else current
             os.environ[name] = value
             _DOTENV_PUBLISHED[name] = (baseline, value, load_pass)
-    _sanitize_loaded_credentials()  # httpx encodes headers as ASCII
+    _sanitize_loaded_credentials(warn=warn)  # httpx encodes headers as ASCII
+    return text
 
 
-def _sanitize_env_file_if_needed(path: Path) -> None:
-    """Pre-sanitize a .env file before python-dotenv reads it. Sniffs a leading BOM *before* any text
-    decode: UTF-16 (Notepad "Unicode") is rewritten as clean UTF-8; UTF-32 is refused (left untouched) so
-    we never fall through to the errors=replace corruption path."""
+def _sanitized_env_file(path: Path, *, warn: bool = True) -> tuple[list[str], bool] | None:
+    """Read and normalize using the existing file sanitizer, without persisting it.
+
+    The boolean says whether normal loading would rewrite the file. Unchanged
+    input must still use the loader's utf8/latin1 decoder, not replacement text.
+    """
     if not path.exists():
         return
     try:
@@ -339,7 +356,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         # Lazy import keeps the module import block identical to #65124's codecs/io additions so the two PRs
         # auto-merge either order.
         path_key = str(path.resolve())
-        if path_key not in _WARNED_UTF32_PATHS:
+        if warn and path_key not in _WARNED_UTF32_PATHS:
             _WARNED_UTF32_PATHS.add(path_key)
             logger.warning("Skipping .env sanitize for %s: UTF-32 BOM detected; "
                            "leaving file untouched to avoid corruption", path)
@@ -369,23 +386,42 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         # Strip NULs (os.environ raises ValueError on them); also repairs BOM-less UTF-16 (NUL-padded ASCII).
         stripped = [line.replace("\x00", "") for line in original]
         sanitized = _sanitize_env_lines(stripped)
-        if sanitized != original or force_utf8_rewrite:
-            import tempfile
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".env_")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.writelines(sanitized)
-                    f.flush()
-                    os.fsync(f.fileno())
-                atomic_replace(tmp, path)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+        return sanitized, sanitized != original or force_utf8_rewrite
     except Exception:
-        pass  # best-effort — don't block gateway startup
+        return None  # best-effort — don't block gateway startup
+
+
+def _sanitize_env_file_if_needed(path: Path) -> None:
+    """Persist the normal startup sanitizer's changes; UTF-32 stays untouched."""
+    result = _sanitized_env_file(path)
+    if result is None or not result[1]:
+        return
+    sanitized, _ = result
+    try:
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".env_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(sanitized)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
+
+
+def _load_readonly_dotenv(
+    path: Path, *, override: bool, load_pass: int | None, sanitize: bool = False,
+) -> str:
+    result = _sanitized_env_file(path, warn=False) if sanitize else None
+    text = "".join(result[0]) if result is not None and result[1] else None
+    return _load_dotenv_with_fallback(path, override=override, load_pass=load_pass, text=text, warn=False)
 
 
 def load_hermes_dotenv(
@@ -393,9 +429,18 @@ def load_hermes_dotenv(
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
     load_external_secrets: bool = True,
+    read_only_files: bool = False,
 ) -> list[Path]:
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
-    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
+    fallback that only fills gaps when the user env exists (and overrides shell vars when it does not).
+
+    ``read_only_files`` keeps the same process-env rules but normalizes files in
+    memory, suppresses diagnostic writes and uses a pure config snapshot for the
+    terminal bridge. It requires ``load_external_secrets=False``; external source
+    implementations do not provide a no-write contract.
+    """
+    if read_only_files and load_external_secrets:
+        raise ValueError("read_only_files requires load_external_secrets=False")
     # Process home on purpose (never the per-turn override): a startup .env load must not follow a routed
     # profile — see the multiplex guard below.
     from hermes_constants import get_process_hermes_home
@@ -409,7 +454,7 @@ def load_hermes_dotenv(
 
     if is_multiplex_active() and get_hermes_home_override() is not None:
         home_key = str(home_path.resolve())
-        if home_key not in _SCOPED_SKIP_LOGGED:
+        if not read_only_files and home_key not in _SCOPED_SKIP_LOGGED:
             _SCOPED_SKIP_LOGGED.add(home_key)
             logger.debug("multiplex: skipping process-global dotenv load for routed "
                          "profile home %s (credentials resolve via the profile scope)", home_path)
@@ -425,25 +470,37 @@ def load_hermes_dotenv(
     project_env_path = Path(project_env) if project_env else None
     load_pass = next(_DOTENV_PASSES)  # one pass: later layers below see the earlier layers' output
 
-    if user_env.exists():  # normalize formatting / strip NULs before parsing
+    if not read_only_files and user_env.exists():  # normalize formatting / strip NULs before parsing
         _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
+    if not read_only_files and project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True, load_pass=load_pass)
+        if read_only_files:
+            text = _load_readonly_dotenv(user_env, override=True, load_pass=load_pass, sanitize=True)
+        else:
+            _load_dotenv_with_fallback(user_env, override=True, load_pass=load_pass)
         loaded.append(user_env)
-        _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
+        if read_only_files:
+            _clear_known_keys_missing_from_dotenv(user_env, text=text)
+        else:
+            _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
     # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
     # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False, load_pass=load_pass)
+        if read_only_files:
+            _load_readonly_dotenv(op_env, override=False, load_pass=load_pass)
+        else:
+            _load_dotenv_with_fallback(op_env, override=False, load_pass=load_pass)
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded, load_pass=load_pass)
+        if read_only_files:
+            _load_readonly_dotenv(project_env_path, override=not loaded, load_pass=load_pass, sanitize=True)
+        else:
+            _load_dotenv_with_fallback(project_env_path, override=not loaded, load_pass=load_pass)
         loaded.append(project_env_path)
 
     # The override=True loads above wrote the raw .env line (``__BITWARDEN_MANAGED__`` placeholder, stale
@@ -470,7 +527,10 @@ def load_hermes_dotenv(
     # managed env still load in both cases; only external source resolution is unnecessary for the updater.
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
         _apply_external_secret_sources(home_path)
-    _apply_managed_env(load_pass=load_pass)
+    if read_only_files:
+        _apply_managed_env(load_pass=load_pass, read_only_files=True)
+    else:
+        _apply_managed_env(load_pass=load_pass)
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
     # ~/.hermes/.env win on every reload and flip the backend mid-session in long-lived processes.
@@ -481,12 +541,15 @@ def load_hermes_dotenv(
     # reload. Startup launchers bridge config→env once, but long-lived processes (gateway per-turn reload,
     # cron standalone runs) call load_hermes_dotenv() repeatedly and used to flip the effective backend back
     # to the stale .env value mid-session (#29186, #67323).
-    _reapply_terminal_config_bridge(home_path)
+    if read_only_files:
+        _reapply_terminal_config_bridge(home_path, read_only_files=True)
+    else:
+        _reapply_terminal_config_bridge(home_path)
 
     return loaded
 
 
-def _reapply_terminal_config_bridge(home_path: Path) -> None:
+def _reapply_terminal_config_bridge(home_path: Path, *, read_only_files: bool = False) -> None:
     """Re-assert config.yaml's explicit ``terminal.*`` keys over reloaded .env via the single shared bridge
     ``apply_terminal_config_to_env`` (also used by terminal_tool and the TUI/dashboard launchers) so the
     semantics can't drift between sites."""
@@ -495,12 +558,15 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
             return
         from hermes_cli.config import apply_terminal_config_to_env
 
-        apply_terminal_config_to_env(env=None)
+        if read_only_files:
+            apply_terminal_config_to_env(env=None, read_only_files=True)
+        else:
+            apply_terminal_config_to_env(env=None)
     except Exception:  # noqa: BLE001 — early bootstrap / malformed config
         pass
 
 
-def _apply_managed_env(*, load_pass: int | None = None) -> None:
+def _apply_managed_env(*, load_pass: int | None = None, read_only_files: bool = False) -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
     from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
     try:
@@ -514,8 +580,11 @@ def _apply_managed_env(*, load_pass: int | None = None) -> None:
     managed_env = managed_dir / ".env"
     if not managed_env.exists():
         return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True, load_pass=load_pass)
+    if read_only_files:
+        _load_readonly_dotenv(managed_env, override=True, load_pass=load_pass, sanitize=True)
+    else:
+        _sanitize_env_file_if_needed(managed_env)
+        _load_dotenv_with_fallback(managed_env, override=True, load_pass=load_pass)
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

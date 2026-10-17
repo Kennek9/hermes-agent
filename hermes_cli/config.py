@@ -1559,7 +1559,7 @@ def _env_ref_lookup(name: str) -> Optional[str]:
     return _get_secret(name)
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(m: re.Match, *, warn: bool = True) -> str:
     """Expand one ``${VAR}`` (legacy bare name) or ``${env:VAR}`` (Cursor-style SecretRef).
     Other SecretRef sources (``file:``, ``bitwarden:``, ``vault:``...) are NOT resolved here:
     external backends inject their values into the environment at startup (the ``secrets:``
@@ -1569,7 +1569,7 @@ def _env_expand_match(m: re.Match) -> str:
     inner = m.group(1).strip()
     name = _env_ref_var_name(inner)
     if name is None:
-        if not inner.startswith("env:") and _is_non_env_secret_ref(inner):
+        if warn and not inner.startswith("env:") and _is_non_env_secret_ref(inner):
             logger.warning(
                 "Config ref %r uses source %r which is not resolvable in "
                 "config.yaml — external secret sources inject env vars at "
@@ -1579,7 +1579,7 @@ def _env_expand_match(m: re.Match) -> str:
     val = _env_ref_lookup(name)
     if val is not None:
         return val
-    if inner.startswith("env:"):
+    if warn and inner.startswith("env:"):
         logger.warning(
             "Config ref %r: %s is not set (check ~/.hermes/.env); "
             "keeping the literal placeholder", raw, name)
@@ -1601,14 +1601,15 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(obj, *, warn: bool = True):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` in string values (keys/non-strings untouched)."""
     if isinstance(obj, str):
-        return _ENV_REF_RE.sub(_env_expand_match, obj)
+        expand = _env_expand_match if warn else lambda match: _env_expand_match(match, warn=False)
+        return _ENV_REF_RE.sub(expand, obj)
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {k: _expand_env_vars(v, warn=warn) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, warn=warn) for item in obj]
     return obj
 
 
@@ -1905,23 +1906,23 @@ def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional
     return None
 
 
-def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _read_raw_config_impl(*, want_deepcopy: bool, pure: bool = False) -> Dict[str, Any]:
     # Lock-free fast path for cache hits — same shape as `_load_config_impl`. `_RAW_CONFIG_CACHE`
     # publishes each entry as ONE `(*sig, data)` tuple replaced wholesale, so a reader sees either
     # the complete old entry or the complete new one; `_CONFIG_LOCK` only serializes the re-parse
     # and the writers (`save_config()` holds it across an atomic YAML write, which used to stall
     # every cached read for the duration). A lost race just falls through to the locked re-check.
     try:
-        config_path = get_config_path()
+        config_path = _snapshot_config_path() if pure else get_config_path()
         cache_key = file_signature(config_path.stat())
-        hit = _raw_config_cache_hit(str(config_path), cache_key)
+        hit = None if pure else _raw_config_cache_hit(str(config_path), cache_key)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
     except Exception:
         pass
 
     with _CONFIG_LOCK:
-        config_path = get_config_path()
+        config_path = _snapshot_config_path() if pure else get_config_path()
         try:
             cache_key = file_signature(config_path.stat())
         except FileNotFoundError:
@@ -1930,7 +1931,7 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             return FailedConfigRead(error=e)
 
         path_key = str(config_path)
-        hit = _raw_config_cache_hit(path_key, cache_key)
+        hit = None if pure else _raw_config_cache_hit(path_key, cache_key)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
@@ -1938,11 +1939,14 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             with open(config_path, encoding="utf-8") as f:
                 data = fast_safe_load(f) or {}
         except Exception as e:
-            _warn_config_parse_failure(config_path, e)
+            if not pure:
+                _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
 
         if not isinstance(data, dict):
             return FailedConfigRead(error=TypeError(f"top-level YAML must be a mapping, got {type(data).__name__}"))
+        if pure:
+            return data
         _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
@@ -2039,6 +2043,25 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_config_snapshot() -> Dict[str, Any]:
+    """Return a fresh canonical merged config without initializing or writing the home.
+
+    Uses the same defaults, user normalization, env expansion, managed overlay and
+    FailedConfigRead fallback as normal loading. Reads existing last-good state or
+    backups on failure, but never creates backups, emits diagnostics, or publishes
+    into the normal load cache. A later normal load still performs initialization.
+    """
+    return _load_config_impl(want_deepcopy=True, pure=True)
+
+
+def _snapshot_config_path() -> Path:
+    # get_hermes_home() warns about sticky profile fallback when no home is set.
+    # Reuse its public context/process resolvers without emitting that diagnostic.
+    from hermes_constants import get_hermes_home_override
+    home = get_hermes_home() if get_hermes_home_override() else get_process_hermes_home()
+    return home / "config.yaml"
+
+
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
     """Return ``parent[key]`` as a dict, replacing a missing or non-dict value with ``{}``."""
     child = parent.get(key)
@@ -2109,20 +2132,24 @@ def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
 
 def apply_terminal_config_to_env(
     *, env: Optional[Dict[str, str]] = None, config: Optional[Dict[str, Any]] = None,
-    override: Optional[bool] = None) -> Dict[str, str]:
+    override: Optional[bool] = None, read_only_files: bool = False) -> Dict[str, str]:
     """Bridge ``terminal.*`` config into the env vars terminal tools read.
     ``tools.terminal_tool`` is environment-driven because it also runs in child processes (TUI,
     dashboard PTY, gateway workers); this gives those launch paths the same bridge as the CLI
     without importing ``cli.py``. Explicit keys in the user's raw ``terminal`` section override
-    matching env values; merged defaults only backfill missing env vars."""
+    matching env values; merged defaults only backfill missing env vars.
+    ``read_only_files`` uses pure merged/raw reads for inspection hosts, preserving
+    the distinction between explicit user keys and merged defaults.
+    """
     target = os.environ if env is None else env
 
-    raw_terminal_cfg = read_raw_config().get("terminal")
+    raw = _read_raw_config_impl(want_deepcopy=True, pure=True) if read_only_files else read_raw_config()
+    raw_terminal_cfg = raw.get("terminal")
     file_has_terminal_config = isinstance(raw_terminal_cfg, dict)
     raw_terminal_cfg = raw_terminal_cfg if file_has_terminal_config else {}
     should_override = file_has_terminal_config if override is None else override
 
-    cfg = config if config is not None else load_config_readonly()
+    cfg = config if config is not None else (load_config_snapshot() if read_only_files else load_config_readonly())
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
         return target
@@ -2170,7 +2197,9 @@ def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int, 
     return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
 
 
-def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
+def _last_known_good_fallback(
+    config_path: Path, path_key: str, cache_sig, exc: Exception, *, pure: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Warn about a parse failure and return the last-known-good config, or None (-> defaults).
     A parse failure must not silently replace the effective config with defaults — that drops
     EVERY user override, including security-critical ``approvals.deny`` rules, when a gateway
@@ -2187,20 +2216,21 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         # It holds the raw file (``${VAR}`` templates intact), so it goes through the same
         # canonicalize -> expand -> managed-overlay pipeline as a normal load.
         from hermes_cli.config_backups import load_newest_good_backup
-        raw_good = load_newest_good_backup(config_path)
+        raw_good = load_newest_good_backup(config_path, warn=False) if pure else load_newest_good_backup(config_path)
         if raw_good is not None:
             normalized = _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good))
-            expanded_good: Dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
-            lkg, _ = _merge_managed_overlay(expanded_good)
+            expanded_good: Dict[str, Any] = _expand_env_vars(normalized, warn=not pure)  # type: ignore[assignment]
+            lkg, _ = _merge_managed_overlay(expanded_good, warn=not pure)
             fallback = "last-known-good-backup"
-    _warn_config_parse_failure(
-        config_path, exc, fallback=fallback if lkg is not None else "defaults")
+    if not pure:
+        _warn_config_parse_failure(
+            config_path, exc, fallback=fallback if lkg is not None else "defaults")
     if lkg is None:
         return None
     # save_config() stores the pre-expansion dict (templates preserved); the load path stores the
     # expanded one. Expand defensively — idempotent when already expanded.
-    lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg)), error=exc)
-    if cache_sig is not None:
+    lkg_copy = FailedConfigRead(_expand_env_vars(copy.deepcopy(lkg), warn=not pure), error=exc)
+    if not pure and cache_sig is not None:
         # Cache under the failed file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse the fallback; fixing the file changes the signature and reloads
         # normally, and a read error is re-probed on every hit (_load_config_cache_hit).
@@ -2208,13 +2238,13 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+def _merge_managed_overlay(expanded: Dict[str, Any], *, warn: bool = True) -> Tuple[Dict[str, Any], Any]:
     """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
     (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
+    managed_config = managed_scope.load_managed_config() if warn else managed_scope.load_managed_config(warn=False)
     if not managed_config:
         return expanded, managed_config
     # Same canonicalization as the user config BEFORE merging (parity with
@@ -2223,7 +2253,7 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _deep_merge(expanded, _expand_env_vars(managed_normalized)), managed_config
+    return _deep_merge(expanded, _expand_env_vars(managed_normalized, warn=warn)), managed_config
 
 
 def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, Any]]:
@@ -2251,15 +2281,15 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
     return None
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool, pure: bool = False) -> Dict[str, Any]:
     # Lock-free fast path for cache hits — same publication contract as `_read_raw_config_impl`
     # above (whole-tuple replace, `_CONFIG_LOCK` only serializes rebuilds and writers). A hit costs
     # ~0.024ms; behind a lock held by `save_config()` the same read measured 10010ms, and on a
     # gateway that stalls every inbound message's hook path. A lost race falls through to the lock.
     try:
-        config_path = get_config_path()
+        config_path = _snapshot_config_path() if pure else get_config_path()
         path_key = str(config_path)
-        if path_key in _LOAD_CONFIG_CACHE:
+        if not pure and path_key in _LOAD_CONFIG_CACHE:
             _, fast_sig = _load_config_cache_sig(config_path)
             hit = _load_config_cache_hit(path_key, fast_sig)
             if hit is not None:
@@ -2270,13 +2300,18 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         pass
 
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        if pure:
+            # Preserve the named-profile admission guard without materializing it.
+            from hermes_constants import assert_named_profile_home_live
+            assert_named_profile_home_live(_snapshot_config_path().parent)
+        else:
+            ensure_hermes_home()
+        config_path = _snapshot_config_path() if pure else get_config_path()
         path_key = str(config_path)
 
         user_sig, cache_sig = _load_config_cache_sig(config_path)
 
-        hit = _load_config_cache_hit(path_key, cache_sig)
+        hit = None if pure else _load_config_cache_hit(path_key, cache_sig)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
@@ -2286,7 +2321,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             try:
                 with open(config_path, encoding="utf-8") as f:
                     user_config = fast_safe_load(f) or {}
-                _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
+                if not pure:
+                    _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -2299,22 +2335,27 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 # A copy of the file that just parsed is what a FRESH process falls back to when the
                 # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
                 # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
-                from hermes_cli.config_backups import backup_config
-                backup_config(config_path, "good")
+                if not pure:
+                    from hermes_cli.config_backups import backup_config
+                    backup_config(config_path, "good")
             except Exception as e:
-                lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
+                lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e, pure=pure)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
                 # Defaults stand in for the unreadable file: never the next last-known-good,
                 # never saveable, and cached like the LKG path.
                 fallback = FailedConfigRead(
-                    _merge_managed_overlay(_expand_env_vars(_canonicalize_config(config)))[0], error=e)
-                if cache_sig is not None:
+                    _merge_managed_overlay(
+                        _expand_env_vars(_canonicalize_config(config), warn=not pure), warn=not pure,
+                    )[0], error=e)
+                if not pure and cache_sig is not None:
                     _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, fallback, {})
                 return copy.deepcopy(fallback) if want_deepcopy else fallback
 
         normalized = _canonicalize_config(config)
-        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
+        expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized, warn=not pure), warn=not pure)
+        if pure:
+            return expanded
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # The cache stores its own deepcopy so load_config() callers can mutate freely while
@@ -3909,7 +3950,7 @@ def _platform_plugin_manifests():
     """Yield ``(dir_name, manifest_dict)`` for every platform plugin manifest: bundled
     ``plugins/platforms/*``, the user's ``<HERMES_HOME>/plugins/platforms/*`` category dir, and flat
     user installs ``<HERMES_HOME>/plugins/*`` that declare ``kind: platform`` (#46600)."""
-    user_plugins = get_hermes_home() / "plugins"
+    user_plugins = _snapshot_config_path().parent / "plugins"
     roots = (
         (get_project_root() / "plugins" / "platforms", False),
         (user_plugins / "platforms", False),

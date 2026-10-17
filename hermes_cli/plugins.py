@@ -11,6 +11,7 @@ and an ``__init__.py`` exposing ``register(ctx)``. Plugins register callbacks fo
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextvars
 import importlib.metadata
 import inspect
@@ -231,9 +232,19 @@ class LoadedPlugin:
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
-    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+    def __init__(
+        self, manifest: PluginManifest, manager: "PluginManager", *,
+        config_snapshot: Optional[Mapping[str, Any]] = None,
+    ):
         self.manifest = manifest
         self._manager = manager
+        # Hosts may supply load_config_snapshot() for inspection without home writes.
+        # Own the mapping so callers cannot change this context after construction.
+        if config_snapshot is None:
+            self._config_snapshot = None
+        else:
+            snapshot = config_snapshot if isinstance(config_snapshot, dict) else dict(config_snapshot)
+            self._config_snapshot = copy.deepcopy(snapshot)
         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
         # Set when this context's load overran ``plugins.load_timeout_seconds``: the abandoned worker may
         # still be running register(), and nothing it registers from then on may reach a registry.
@@ -269,9 +280,12 @@ class PluginContext:
 
     def get_config(self, key: str, default: Any = None) -> Any:
         """Read plugin-relative ``plugins.entries.<plugin_id>.settings.<key>`` (falls back to the
-        legacy ``config`` subtree for migration compatibility)."""
-        segments = self._segments(key)
-        entry = _plugin_settings_entry(load_config_readonly() or {}, self.plugin_id)
+        legacy ``config`` subtree for migration compatibility). A supplied canonical
+        snapshot is reused without loading or initializing the active profile.
+        """
+        segments = self._segments(key) if self._config_snapshot is None else _plugin_relative_segments(key)
+        config = load_config_readonly() if self._config_snapshot is None else self._config_snapshot
+        entry = _plugin_settings_entry(config or {}, self.plugin_id)
         if entry is None:
             return default
         value = _nested_plugin_value(entry.get("settings"), segments, _UNSET)

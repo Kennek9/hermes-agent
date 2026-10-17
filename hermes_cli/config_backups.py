@@ -69,7 +69,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         return None
 
 
-def load_newest_good_backup(config_path: Path) -> Optional[dict]:
+def load_newest_good_backup(config_path: Path, *, warn: bool = True) -> Optional[dict]:
     """Parse the newest ``good`` backup (the file as it was at the last successful load).
 
     Returns the raw mapping, or None when there is no usable copy. Older ``good`` copies are not
@@ -84,7 +84,8 @@ def load_newest_good_backup(config_path: Path) -> Optional[dict]:
         with newest[0].open(encoding="utf-8") as f:
             data = fast_safe_load(f)
     except Exception as exc:
-        logger.warning("Last-known-good backup %s is unreadable: %s", newest[0], exc)
+        if warn:
+            logger.warning("Last-known-good backup %s is unreadable: %s", newest[0], exc)
         return None
     return data if isinstance(data, dict) else None
 

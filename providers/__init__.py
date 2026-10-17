@@ -467,10 +467,14 @@ def _discover_entry_point_providers() -> None:
     # Same opt-in gate as the general PluginManager: only entry points named
     # in ``plugins.enabled`` load, and ``plugins.disabled`` always wins.
     try:
+        from hermes_cli.config import load_config_snapshot
         from hermes_cli.plugins import _get_disabled_plugins, _get_enabled_plugins
 
-        enabled = _get_enabled_plugins()  # None = nothing enabled yet (opt-in default)
-        disabled = _get_disabled_plugins()
+        # Config imports this metadata discovery to describe provider env vars.
+        # Inspect the same allow/deny policy without initializing the profile.
+        snapshot = load_config_snapshot()
+        enabled = _get_enabled_plugins(config_snapshot=snapshot)  # None = opt-in default
+        disabled = _get_disabled_plugins(config_snapshot=snapshot)
     except Exception:  # pragma: no cover — config layer unavailable
         enabled, disabled = None, set()
     if not enabled:

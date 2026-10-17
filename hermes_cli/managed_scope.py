@@ -66,7 +66,7 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, warn: bool = True):
     """Shared stat-signature-keyed read; returns a deepcopy of the parsed value.
 
     ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
@@ -86,28 +86,31 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     try:
         parsed = parse(path)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
-        logger.warning(
-            "managed scope: failed to parse %s: %s — IGNORING this managed file. "
-            "Admin policy from this file is NOT being applied. Fix and restart.",
-            path, exc)
+        if warn:
+            logger.warning(
+                "managed scope: failed to parse %s: %s — IGNORING this managed file. "
+                "Admin policy from this file is NOT being applied. Fix and restart.",
+                path, exc)
         return None
     with _CACHE_LOCK:
         cache[path_key] = (*key, copy.deepcopy(parsed))
     return parsed
 
 
-def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
+def _load_managed_file(name: str, cache: Dict[str, tuple], parse, *, warn: bool = True) -> dict:
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / name, cache, parse)
+    parsed = _cached_read(managed_dir / name, cache, parse, warn=warn)
     return parsed if isinstance(parsed, dict) else {}
 
 
-def load_managed_config() -> dict:
+def load_managed_config(*, warn: bool = True) -> dict:
     """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
 
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8")) or {})
+    return _load_managed_file(
+        "config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8")) or {}, warn=warn,
+    )
 
 
 def load_managed_env() -> Dict[str, str]:
