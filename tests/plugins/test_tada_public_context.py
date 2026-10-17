@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from slack_sdk.web.async_client import AsyncWebClient
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from gateway.config import PlatformConfig
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
@@ -143,15 +145,21 @@ async def test_source_reread_is_read_only_exact_workspace_and_host_loop(tmp_path
 
     ctx = context(tmp_path)
     host = asyncio.get_running_loop()
+    sdk_client = AsyncWebClient(token="synthetic-local")
 
     async def read(method, *, http_verb, params):
         assert asyncio.get_running_loop() is host
         if method == "chat.getPermalink":
             assert params == {"channel": "D_A", "message_ts": "123.45"}
-            return {"ok": True, "permalink": "https://workspace.slack.com/archives/D_A/p12345"}
-        assert method == "conversations.history" and http_verb == "GET"
-        assert params == {"channel": "D_A", "latest": "123.45", "inclusive": True, "limit": 1}
-        return {"ok": True, "messages": [{"ts": "123.45", "text": "source"}]}
+            payload = {"ok": True, "permalink": "https://workspace.slack.com/archives/D_A/p12345"}
+        else:
+            assert method == "conversations.history" and http_verb == "GET"
+            assert params == {"channel": "D_A", "latest": "123.45", "inclusive": True, "limit": 1}
+            payload = {"ok": True, "messages": [{"ts": "123.45", "text": "source"}]}
+        return AsyncSlackResponse(
+            client=sdk_client, http_verb=http_verb, api_url="https://slack.com/api/" + method,
+            req_args={"params": params}, data=payload, headers={}, status_code=200,
+        ).validate()
 
     client = SimpleNamespace(api_call=AsyncMock(side_effect=read))
     adapter = SimpleNamespace(_team_clients={"T_A": client})

@@ -250,7 +250,10 @@ class PlatformActions:
                 return _err("workspace_unavailable")
             try:
                 response = await client.api_call(method, http_verb="GET", params=params)
-                return dict(response)
+                payload = response.data
+                if not isinstance(payload, dict) or payload.get("ok") is not True:
+                    return _err("slack_api_failed")
+                return dict(payload)
             except Exception:
                 logger.warning("Plugin Slack source read failed for %s", self._plugin_id)
                 return _err("slack_api_failed")
