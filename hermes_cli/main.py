@@ -2941,8 +2941,9 @@ def _prepare_agent_startup(args) -> None:
         return
 
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
-    if not _is_tui_chat_launch(args):
-        # The TUI backend does its own discovery; the launcher only spawns Node.
+    if not _is_tui_chat_launch(args) and args.command != "gateway":
+        # The TUI backend discovers plugins itself. Gateway registration can start
+        # profile-owned tasks, so its async startup owns discovery after the loop exists.
         try:
             from hermes_cli.plugins import start_background_plugin_discovery
 

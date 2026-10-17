@@ -2080,9 +2080,8 @@ def _bridge_config_to_env(_cfg: dict) -> None:
     _terminal_cfg = _cfg.get("terminal", {})
     if _terminal_cfg and isinstance(_terminal_cfg, dict):
         _bridge_terminal_config_to_env(_terminal_cfg)
-    _auxiliary_cfg = _cfg.get("auxiliary", {})
-    if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-        _bridge_auxiliary_config_to_env(_auxiliary_cfg)
+    # Auxiliary task discovery activates plugins. The async gateway startup bridges
+    # these settings after discovery, once profile-owned tasks have a live host loop.
     # config.yaml is the documented, authoritative source for these settings — it unconditionally wins over
     # .env values. Previously the guards below read `if X not in os.environ` and let stale .env entries
     # (e.g. HERMES_MAX_ITERATIONS=60 written by an old `hermes setup` run) silently shadow the user's

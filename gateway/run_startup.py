@@ -1018,6 +1018,11 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.WARNING, "plugin discovery failed at gateway startup", exc_info=True):
             from hermes_cli.plugins import discover_plugins
             discover_plugins()
+        with _log_suppressed(logging.WARNING, "auxiliary config bridge failed at gateway startup", exc_info=True):
+            from gateway.run import _bridge_auxiliary_config_to_env, _cfg
+            auxiliary_cfg = _cfg.get("auxiliary", {})
+            if auxiliary_cfg and isinstance(auxiliary_cfg, dict):
+                _bridge_auxiliary_config_to_env(auxiliary_cfg)
         # Relay entrypoints share the effective profile opt-out, including when a
         # deployment injects a URL. No URL or explicitly disabled -> no side effects.
         try:
