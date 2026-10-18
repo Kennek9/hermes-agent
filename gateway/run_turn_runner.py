@@ -1983,6 +1983,7 @@ class TurnRunner:
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
+            "turn_id": result.get("turn_id"),
             **usage,
         }
         if not final_response:
