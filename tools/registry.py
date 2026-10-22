@@ -844,12 +844,16 @@ class ToolRegistry:
 
     # ---- Schema retrieval --------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self, tool_names: Set[str], quiet: bool = False, *, include_hidden: bool = False,
+    ) -> List[dict]:
         """OpenAI-format schemas for the requested tools whose ``check_fn`` passes (or is
-        absent). Probes use the ~30 s TTL cache so ``hermes tools enable`` lands quickly."""
+        absent). Host dispatch may include hidden entries; model catalogs never do.
+        Probes use the ~30 s TTL cache so ``hermes tools enable`` lands quickly."""
         result = []
         check_results: Dict[Callable, bool] = {}
-        entries_by_name = {entry.name: entry for entry in self._snapshot_model_entries()}
+        entries = self._snapshot_entries() if include_hidden else self._snapshot_model_entries()
+        entries_by_name = {entry.name: entry for entry in entries}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:

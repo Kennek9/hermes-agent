@@ -278,17 +278,23 @@ def _tool_defs_cache_key(
     )
 
 
-def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, disable: bool) -> None:
+def _apply_toolset_selection(
+    tools: set, names: List[str], quiet_mode: bool, *,
+    disable: bool, include_hidden: bool = False,
+) -> None:
     """Add (or subtract) every toolset in *names* to/from *tools*, printing the selection unless quiet."""
     from toolsets import bundle_non_core_tools, get_toolset
     verb, icon = ("Disabled", "🚫") if disable else ("Enabled", "✅")
     for name in names:
-        if validate_toolset(name):
+        if validate_toolset(name, include_hidden=include_hidden):
             label = f"{verb} toolset"
-            if disable and (name.startswith("hermes-") or (get_toolset(name) or {}).get("posture")):
+            if disable and (
+                name.startswith("hermes-")
+                or (get_toolset(name, include_hidden=include_hidden) or {}).get("posture")
+            ):
                 # Bundles/postures re-list the core tools without owning them;
                 # subtracting the whole set would empty the list — remove only the non-core delta.
-                resolved = sorted(bundle_non_core_tools(name))
+                resolved = sorted(bundle_non_core_tools(name, include_hidden=include_hidden))
                 if not quiet_mode and name.startswith("hermes-") and name not in _WARNED_DISABLED_BUNDLES:
                     _WARNED_DISABLED_BUNDLES.add(name)
                     logger.info(
@@ -298,7 +304,7 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
                         name, ", ".join(resolved) if resolved else "none",
                     )
             else:
-                resolved = resolve_toolset(name)
+                resolved = resolve_toolset(name, include_hidden=include_hidden)
         elif name in _LEGACY_TOOLSET_MAP:
             label = f"{verb} legacy toolset"
             resolved = _LEGACY_TOOLSET_MAP[name]
@@ -311,7 +317,10 @@ def _apply_toolset_selection(tools: set, names: List[str], quiet_mode: bool, *, 
             print(f"{icon} {label} '{name}': {', '.join(resolved) if resolved else 'no tools'}")
 
 
-def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], quiet_mode: bool) -> set:
+def _select_tool_names(
+    enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]],
+    quiet_mode: bool, *, include_hidden: bool = False,
+) -> set:
     """Tool names requested by the toolset selection (before check_fn filtering)."""
     tools: set = set()
     if enabled_toolsets is not None:
@@ -321,23 +330,42 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
         if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
                 and _is_dispatcher_owned_worker() and "kanban" not in enabled):
             enabled.append("kanban")
-        _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
+        _apply_toolset_selection(tools, enabled, quiet_mode, disable=False, include_hidden=include_hidden)
     else:
         from toolsets import get_all_toolsets
-        for ts_name in get_all_toolsets():
-            tools.update(resolve_toolset(ts_name))
+        for ts_name in get_all_toolsets(include_hidden=include_hidden):
+            tools.update(resolve_toolset(ts_name, include_hidden=include_hidden))
     # A role-reserved toolset (``setup``) reaches only a profile carrying that role, whatever the config,
     # CLI flag, env pin or "all" asked for; this is the one point every surface's selection passes.
     from toolsets import profile_role_toolsets
     for ts_name in profile_role_toolsets()[1]:
-        tools.difference_update(resolve_toolset(ts_name))
+        tools.difference_update(resolve_toolset(ts_name, include_hidden=include_hidden))
     # Disabled toolsets are always subtracted LAST, so a tool in a disabled
     # toolset is stripped even when a composite (hermes-cli) re-enables it.
     # This ensures that even if a composite toolset (like hermes-cli) is enabled, any tools belonging to a
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
-        _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+        _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True, include_hidden=include_hidden)
     return tools
+
+
+def is_tool_in_dispatch_scope(
+    tool_name: str,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> bool:
+    """Check one execution target without advertising hidden compatibility schemas.
+
+    Selection and role restrictions are shared with model tools. Probe only this
+    entry's check_fn, using the registry's existing profile-aware availability cache.
+    """
+    from tools.tool_search import scoped_deferrable_names
+
+    selected = _select_tool_names(enabled_toolsets, disabled_toolsets, True, include_hidden=True)
+    if tool_name not in selected:
+        return False
+    definitions = registry.get_definitions({tool_name}, quiet=True, include_hidden=True)
+    return tool_name in scoped_deferrable_names(definitions)
 
 
 # --- Dynamic schema rewrites -------------------------------------------------
@@ -738,7 +766,7 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
         return None, (underlying_name, underlying_args)
     # Defense in depth: resolve_underlying_call only checks the global
     # registry; also require membership in the session-scoped catalog.
-    if underlying_name not in ts.scoped_deferrable_names(current_defs):
+    if not is_tool_in_dispatch_scope(underlying_name, enabled_toolsets, disabled_toolsets):
         return tool_error(f"'{underlying_name}' is not available in this session. "
                           "Use tool_search to find tools you can call."), None
     # Validate against the deferred tool's concrete schema — the generic

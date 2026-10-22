@@ -258,9 +258,9 @@ class TestResolveToolsetMemo:
 
         orig_get_toolset = toolsets_mod.get_toolset
 
-        def counting_get_toolset(name, *, include_registry=True):
+        def counting_get_toolset(name, *, include_registry=True, include_hidden=False):
             get_toolset_calls["n"] += 1
-            return orig_get_toolset(name, include_registry=include_registry)
+            return orig_get_toolset(name, include_registry=include_registry, include_hidden=include_hidden)
 
         monkeypatch.setattr(toolsets_mod, "get_toolset", counting_get_toolset)
 
