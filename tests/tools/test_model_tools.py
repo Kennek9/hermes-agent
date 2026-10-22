@@ -492,21 +492,38 @@ class TestBridgeDispatch:
         assert result.get("error")
 
     def test_tool_call_rejects_out_of_scope_and_unwraps_in_scope(self):
-        import tools.tool_search as ts
-        with patch("model_tools.get_tool_definitions", return_value=[]), \
-             patch.object(ts, "resolve_underlying_call", return_value=("mcp_x", {"a": 1}, None)), \
-             patch.object(ts, "scoped_deferrable_names", return_value=frozenset()):
-            result = json.loads(handle_function_call("tool_call", {"name": "mcp_x"}))
-        assert result.get("error")
+        from tools.registry import registry
 
-        with patch("model_tools.get_tool_definitions", return_value=[]), \
-             patch.object(ts, "resolve_underlying_call", return_value=("mcp_x", {"a": 1}, None)), \
-             patch.object(ts, "scoped_deferrable_names", return_value=frozenset({"mcp_x"})), \
-             patch.object(ts, "validate_deferred_call_args", return_value=None), \
-             patch("model_tools.registry.dispatch", return_value='{"ok": true}') as disp:
-            out = handle_function_call("tool_call", {"name": "mcp_x"}, task_id="t")
-        assert json.loads(out) == {"ok": True}
-        assert disp.call_args.args[0] == "mcp_x" and disp.call_args.args[1] == {"a": 1}
+        name, toolset = "mcp_bridge_scope_fixture", "mcp-bridge-scope-fixture"
+        calls = []
+
+        def handler(args, task_id=None):
+            calls.append((dict(args), task_id))
+            return json.dumps({"ok": True})
+
+        assert registry.get_entry(name) is None
+        registry.register(
+            name=name, toolset=toolset, handler=handler, model_visible=False,
+            deprecated=True, schema={"name": name, "parameters": {
+                "type": "object", "properties": {"a": {"type": "integer"}},
+                "required": ["a"], "additionalProperties": False,
+            }},
+        )
+        envelope = {"calls": [{"name": name, "arguments": {"a": 1}}]}
+        try:
+            result = json.loads(handle_function_call(
+                "tool_call", envelope, enabled_toolsets=["file"],
+            ))
+            assert result.get("error")
+            assert calls == []
+            out = handle_function_call(
+                "tool_call", envelope, task_id="t", enabled_toolsets=[toolset],
+            )
+            assert json.loads(out) == {"ok": True}
+            assert calls == [({"a": 1}, "t")]
+        finally:
+            registry.deregister(name)
+
 
 
 # ==================================================================
