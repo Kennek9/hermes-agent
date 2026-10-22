@@ -278,7 +278,9 @@ def _registry_generation() -> Tuple[int, int]:
     return (id(reg), getattr(reg, "_generation", 0)) if reg is not None else (0, 0)
 
 
-def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[str, Any]]:
+def get_toolset(
+    name: str, *, include_registry: bool = True, include_hidden: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Toolset definition, or None if unknown.
 
     include_registry=True merges plugin/overlay tools registered into this toolset
@@ -299,17 +301,23 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     if registry is None:
         return toolset if toolset else None
 
+    def members(toolset_name: str) -> List[str]:
+        if include_hidden:
+            return [entry.name for entry in registry.get_all_entries(include_hidden=True)
+                    if entry.toolset == toolset_name]
+        return registry.get_tool_names_for_toolset(toolset_name)
+
     if toolset:
-        merged_tools = set(toolset.get("tools", [])) | set(registry.get_tool_names_for_toolset(name))
+        merged_tools = set(toolset.get("tools", [])) | set(members(name))
         # An MCP server named like a built-in toolset ("homeassistant", "browser") registers a bare
         # alias to its `mcp-<name>` toolset; without this union the static entry shadows it and the
         # server's tools never reach the model even though discovery registered them.
         alias_target = registry.get_toolset_alias_target(name)
         if alias_target and alias_target != name:
-            merged_tools |= set(registry.get_tool_names_for_toolset(alias_target))
+            merged_tools |= set(members(alias_target))
         return {**toolset, "tools": sorted(merged_tools)}
 
-    if name in _get_plugin_toolset_names():
+    if name in _get_plugin_toolset_names(include_hidden=include_hidden):
         # Plugin toolset; shown as its MCP server alias when one exists.
         registry_toolset = name
         alias = _display_alias(name, _get_registry_toolset_aliases())
@@ -319,10 +327,10 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
         if not registry_toolset:
             return None
         description = f"MCP server '{name}' tools"
-    return {"description": description, "tools": registry.get_tool_names_for_toolset(registry_toolset), "includes": []}
+    return {"description": description, "tools": members(registry_toolset), "includes": []}
 
 
-def bundle_non_core_tools(toolset_name: str) -> Set[str]:
+def bundle_non_core_tools(toolset_name: str, *, include_hidden: bool = False) -> Set[str]:
     """A bundle's tools minus _HERMES_CORE_TOOLS (one level of includes).
 
     Disabling a `core + extras` bundle must not strip the core tools every other
@@ -330,24 +338,26 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     bundles). Unknown names: full resolution minus core.
     """
     core = set(_HERMES_CORE_TOOLS)
-    ts_def = get_toolset(toolset_name)
+    ts_def = get_toolset(toolset_name, include_hidden=include_hidden)
     if not (ts_def and "tools" in ts_def):
-        return set(resolve_toolset(toolset_name)) - core
+        return set(resolve_toolset(toolset_name, include_hidden=include_hidden)) - core
     to_remove = set(ts_def["tools"])
-    for inc_def in map(get_toolset, ts_def.get("includes", [])):
+    included = (get_toolset(name, include_hidden=include_hidden)
+                for name in ts_def.get("includes", []))
+    for inc_def in included:
         if inc_def and "tools" in inc_def:
             to_remove.update(inc_def["tools"])
     return to_remove - core
 
 
-# Memo keyed on (name, include_registry, id(registry), registry generation, profile scope);
+# Memo keyed on name, registry/visibility options, registry generation and profile scope;
 # engages only at the public entry (visited is None). The scope is part of the key because a
 # multiplexed process resolves ``mcp-<server>`` per profile overlay: without it profile B got
 # profile A's tool names for a server B never connected (#106005).
-_resolve_toolset_memo: Dict[Tuple[str, bool, int, int, str], List[str]] = {}
+_resolve_toolset_memo: Dict[Tuple[str, bool, bool, int, int, str], List[str]] = {}
 
 
-def _plugin_platform_bundle(name: str) -> List[str]:
+def _plugin_platform_bundle(name: str, *, include_hidden: bool = False) -> List[str]:
     """Implicit `hermes-<platform>` bundle for a registered plugin platform: core
     tools plus whatever the plugin registered under the platform name. [] otherwise."""
     if not name.startswith("hermes-"):
@@ -361,15 +371,21 @@ def _plugin_platform_bundle(name: str) -> List[str]:
         return []
     tools = set(_HERMES_CORE_TOOLS)
     try:
-        tools.update(e.name for e in _registry_call("get_all_entries", ()) if e.toolset == platform_name)
+        registry = _registry()
+        entries = registry.get_all_entries(include_hidden=include_hidden) if registry is not None else ()
+        tools.update(e.name for e in entries if e.toolset == platform_name)
     except Exception:
         pass
     return list(tools)
 
 
-def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bool = True) -> List[str]:
+def resolve_toolset(
+    name: str, visited: Set[str] = None, *,
+    include_registry: bool = True, include_hidden: bool = False,
+) -> List[str]:
     """Recursively resolve a toolset (and its includes) to a sorted tool-name list.
     include_registry=False resolves the static TOOLSETS view only.
+    include_hidden=True is for host execution scope, never the model catalog.
 
     Args: name (str): Name of the toolset to resolve visited (Set[str]): Set of already visited toolsets
     (for cycle detection) include_registry (bool): When True (default), include tools that plugins/overlays
@@ -378,7 +394,10 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     """
     external_call = visited is None
     if external_call:
-        memo_key = (name, include_registry, *_registry_generation(), _registry_call("current_scope_key", ""))
+        memo_key = (
+            name, include_registry, include_hidden, *_registry_generation(),
+            _registry_call("current_scope_key", ""),
+        )
         cached = _resolve_toolset_memo.get(memo_key)
         if cached is not None:
             return list(cached)
@@ -387,8 +406,11 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     # "all"/"*" span every toolset so new toolsets are included automatically.
     if name in {"all", "*"}:
         all_tools: Set[str] = set()
-        for toolset_name in get_toolset_names():
-            all_tools.update(resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry))
+        for toolset_name in get_toolset_names(include_hidden=include_hidden):
+            all_tools.update(resolve_toolset(
+                toolset_name, visited.copy(), include_registry=include_registry,
+                include_hidden=include_hidden,
+            ))
         return sorted(all_tools)
 
     # Diamond include or cycle: [] silently — the tools are collected via another path.
@@ -396,13 +418,15 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
         return []
     visited.add(name)
 
-    toolset = get_toolset(name, include_registry=include_registry)
+    toolset = get_toolset(name, include_registry=include_registry, include_hidden=include_hidden)
     if not toolset:
-        return _plugin_platform_bundle(name) if include_registry else []
+        return _plugin_platform_bundle(name, include_hidden=include_hidden) if include_registry else []
 
     tools = set(toolset.get("tools", []))
     for included_name in toolset.get("includes", []):
-        tools.update(resolve_toolset(included_name, visited, include_registry=include_registry))
+        tools.update(resolve_toolset(
+            included_name, visited, include_registry=include_registry, include_hidden=include_hidden,
+        ))
 
     result = sorted(tools)
     if external_call:
@@ -412,8 +436,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     return result
 
 
-def _get_plugin_toolset_names() -> Set[str]:
+def _get_plugin_toolset_names(*, include_hidden: bool = False) -> Set[str]:
     """Registry toolset names absent from the static TOOLSETS dict."""
+    if include_hidden:
+        registry = _registry()
+        entries = registry.get_all_entries(include_hidden=True) if registry is not None else ()
+        return {entry.toolset for entry in entries if entry.toolset not in TOOLSETS}
     return {n for n in _registry_call("get_registered_toolset_names", ()) if n not in TOOLSETS}
 
 
@@ -426,29 +454,30 @@ def _display_alias(ts_name: str, aliases: Dict[str, str]) -> Optional[str]:
     return next((a for a, canonical in aliases.items() if canonical == ts_name and a not in TOOLSETS), None)
 
 
-def _plugin_display_names() -> List[str]:
+def _plugin_display_names(*, include_hidden: bool = False) -> List[str]:
     """Plugin toolset names, shown under their first non-static alias when one exists."""
     aliases = _get_registry_toolset_aliases()
-    return [_display_alias(n, aliases) or n for n in _get_plugin_toolset_names()]
+    return [_display_alias(n, aliases) or n
+            for n in _get_plugin_toolset_names(include_hidden=include_hidden)]
 
 
-def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
+def get_all_toolsets(*, include_hidden: bool = False) -> Dict[str, Dict[str, Any]]:
     """All toolset definitions: static plus plugin-registered."""
     result = dict(TOOLSETS)
     aliases = _get_registry_toolset_aliases()
-    for display_name in _plugin_display_names():
-        toolset = None if display_name in result else get_toolset(display_name)
+    for display_name in _plugin_display_names(include_hidden=include_hidden):
+        toolset = None if display_name in result else get_toolset(display_name, include_hidden=include_hidden)
         if toolset:
             result[display_name] = toolset
     # Static names an MCP server also aliases show the merged view get_toolset() resolves.
     for name in TOOLSETS.keys() & aliases.keys():
-        result[name] = get_toolset(name) or result[name]
+        result[name] = get_toolset(name, include_hidden=include_hidden) or result[name]
     return result
 
 
-def get_toolset_names() -> List[str]:
+def get_toolset_names(*, include_hidden: bool = False) -> List[str]:
     """Sorted names of all toolsets (static + plugin), excluding aliases."""
-    return sorted(set(TOOLSETS.keys()) | set(_plugin_display_names()))
+    return sorted(set(TOOLSETS.keys()) | set(_plugin_display_names(include_hidden=include_hidden)))
 
 
 def profile_role_toolsets(profile_home: Optional[Path] = None) -> Tuple[Set[str], Set[str]]:
@@ -463,9 +492,9 @@ def profile_role_toolsets(profile_home: Optional[Path] = None) -> Tuple[Set[str]
     return granted, denied
 
 
-def validate_toolset(name: str) -> bool:
+def validate_toolset(name: str, *, include_hidden: bool = False) -> bool:
     return (name in {"all", "*"} or name in TOOLSETS
-            or name in _get_plugin_toolset_names() or name in _get_registry_toolset_aliases())
+            or name in _get_plugin_toolset_names(include_hidden=include_hidden) or name in _get_registry_toolset_aliases())
 
 
 def create_custom_toolset(name: str, description: str, tools: List[str] = None, includes: List[str] = None) -> None:

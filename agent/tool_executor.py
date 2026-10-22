@@ -347,37 +347,15 @@ def _append_skipped_tool_results(
     return True
 
 
-def _tool_search_scoped_names(agent) -> frozenset:
-    """Deferrable tool names the session may invoke via ``tool_call``; the unwrap bypasses
-    the bridge's scope check in ``model_tools.handle_function_call``, so restricted sessions
-    validate against this set. Cached on the agent, keyed by registry scope/generation."""
+def _tool_search_scope_allows(agent, name: str) -> bool:
+    """Apply the bridge's execution scope, including per-entry availability for hidden aliases."""
     try:
         import model_tools
-        from tools import tool_search as _ts
-        from tools.registry import registry as _registry
+        return model_tools.is_tool_in_dispatch_scope(
+            name, getattr(agent, "enabled_toolsets", None), getattr(agent, "disabled_toolsets", None),
+        )
     except Exception:
-        return frozenset()
-
-    enabled = getattr(agent, "enabled_toolsets", None)
-    disabled = getattr(agent, "disabled_toolsets", None)
-    cache_key = (
-        _registry.current_scope_key(),
-        getattr(_registry, "_generation", 0),
-        frozenset(enabled) if enabled is not None else None,
-        frozenset(disabled) if disabled is not None else None,
-    )
-    cached = getattr(agent, "_tool_search_scope_cache", None)
-    if cached is not None and cached[0] == cache_key:
-        return cached[1]
-    try:
-        names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
-            enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
-        ) or [])
-    except Exception:
-        names = frozenset()
-    with contextlib.suppress(Exception):
-        agent._tool_search_scope_cache = (cache_key, names)
-    return names
+        return False
 
 
 def _canonical_tool_name(function_name: str) -> str:
@@ -412,7 +390,7 @@ def _unwrap_tool_search_call(
             # Both executors retain the wrapper: scope/probe/hooks run per entry
             # in the batch dispatcher, not against a synthetic registry name.
             return function_name, function_args, None
-        if underlying not in _tool_search_scoped_names(agent):
+        if not _tool_search_scope_allows(agent, underlying):
             return function_name, function_args, (
                 f"'{underlying}' is not available in this session. Use tool_search to find tools you can call."
             )

@@ -44,6 +44,23 @@ Each call creates a `ToolEntry` stored in the singleton `ToolRegistry._tools` di
 
 `schema["description"]` is the authoritative model-facing description. The separate `description=` argument populates `ToolEntry.description`; when it is omitted, the registry metadata falls back to the schema description. `get_definitions()` builds the OpenAI function definition from `entry.schema` and does not copy `entry.description` into a schema that lacks `description`. Therefore, `description=` alone does not describe the tool to the model, and when both values differ the model sees the schema value. Prefer defining the description once in the schema unless a registry consumer intentionally needs different metadata.
 
+### Hidden compatibility entries
+
+`model_visible=False` removes a registration from provider schemas, tool search and tool
+descriptions. It does not disable its handler. `deprecated=True` records migration status
+independently of visibility.
+
+Host execution uses `model_tools.is_tool_in_dispatch_scope()` for both `tool_call` dispatch
+and the agent executor's unwrap. It resolves the same enabled toolsets, aliases, includes,
+role restrictions and explicit disabled toolsets, then checks the target entry's own
+`check_fn`. Both call paths retain concrete parameter schema validation after the scope check. Another available member of the same toolset
+does not make an unavailable hidden entry callable. Profile overlays apply to both catalogs.
+
+The registry and toolset resolvers accept `include_hidden=True` for this host-only view.
+Model-facing calls keep the default `False`. Toolset memo keys include this option and the
+active profile; execution availability uses the registry's profile-aware probe cache rather
+than an agent-local copy of an earlier eligibility decision.
+
 ### Discovery: `discover_builtin_tools()`
 
 When `model_tools.py` is imported, it calls `discover_builtin_tools()` from `tools/registry.py`. This function scans every `tools/*.py` file using AST parsing to find modules that contain top-level `registry.register()` calls, then imports them:
