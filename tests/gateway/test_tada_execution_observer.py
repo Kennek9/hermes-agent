@@ -192,6 +192,9 @@ async def test_core_turn_identity_survives_real_runner_and_dispatch(
 ):
     from hermes_cli.plugins import PluginContext, PluginManifest, discover_plugins, get_plugin_manager
 
+    import asyncio
+    import time
+
     calls, results = [], []
     discover_plugins()
     context = PluginContext(PluginManifest(name="turn-delivery-test"), get_plugin_manager())
@@ -217,7 +220,10 @@ async def test_core_turn_identity_survives_real_runner_and_dispatch(
     adapter.set_message_handler(handler)
     event = MessageEvent(text="Synthetic request", message_type=MessageType.TEXT, source=source)
     try:
-        await adapter._process_message_background(event, key)
+        before = time.monotonic()
+        await adapter.handle_message(event)
+        await asyncio.gather(*tuple(adapter._session_tasks.values()))
+        after = time.monotonic()
     finally:
         registration.dispose()
     assert len(agents) == 1
@@ -238,6 +244,12 @@ async def test_core_turn_identity_survives_real_runner_and_dispatch(
         assert calls[0]["generation_failed"] is failed
         assert calls[0]["outcome"] == outcome
         assert calls[0]["message_id"] == (adapter.result.message_id if adapter.sent else "")
+        clocks = calls[0]["gateway_timing"]
+        if final and not failed:
+            assert 0 <= clocks["first_text_elapsed_ms"] <= (after - before) * 1000
+            assert clocks["delivery_elapsed_ms"] >= clocks["first_text_elapsed_ms"]
+        elif failed:
+            assert clocks == {}
     assert adapter.sent == ([result["final_response"]] if result["final_response"] else [])
 
 
@@ -280,3 +292,143 @@ async def test_resolution_failure_without_a_core_turn_never_fabricates_delivery(
     assert calls == []
     assert not hasattr(event, "_execution_observation")
     assert adapter.sent == [results[0]["final_response"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["queued", "merged", "internal", "redirected"])
+async def test_inbound_clock_includes_real_queue_wait_and_does_not_reassign_ambiguous_inputs(
+    monkeypatch, mode
+):
+    import asyncio
+    import time
+    import hermes_cli.lifecycle
+
+    started, release, delivered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+    adapter = Adapter(SendResult(success=True, message_id="clock-receipt"))
+    source = SessionSource(platform=Platform.SLACK, user_id="U_CLOCK", chat_id="D_CLOCK", chat_type="dm")
+
+    def observed(name, **kwargs):
+        if name == "gateway_delivery":
+            calls.append(kwargs)
+            if kwargs["turn_id"] == "queued-turn":
+                # Hook runs in a worker thread; notify the original loop safely.
+                loop.call_soon_threadsafe(delivered.set)
+
+    monkeypatch.setattr(hermes_cli.lifecycle, "invoke_hook", observed)
+    loop = asyncio.get_running_loop()
+    handler_times = {}
+
+    async def handler(event):
+        if event.message_id == "first":
+            started.set()
+            await release.wait()
+        else:
+            handler_times["queued"] = time.monotonic()
+        attach_execution(event, {"session_id": "queue-session", "turn_id": "first-turn" if event.message_id == "first" else "queued-turn"})
+        return "A completed answer"
+
+    adapter.set_message_handler(handler)
+    first = MessageEvent(text="First", source=source, message_id="first")
+    second = MessageEvent(text="Second", source=source, message_id="second", internal=mode == "internal")
+    await adapter.handle_message(first)
+    await asyncio.wait_for(started.wait(), 3)
+    await adapter.handle_message(second)
+    received = getattr(second, "_execution_received_clock", None)
+    assert "queued" not in handler_times
+    if mode == "merged":
+        await adapter.handle_message(MessageEvent(text="Third", source=source, message_id="third"))
+    if mode == "redirected":
+        second.reply_anchor_override = "different-input"
+    released_at = time.monotonic()
+    release.set()
+    await asyncio.wait_for(delivered.wait(), 5)
+    await asyncio.gather(*tuple(adapter._session_tasks.values()))
+    queued = next(item for item in calls if item["turn_id"] == "queued-turn")
+    assert queued["session_id"] == "queue-session"
+    assert handler_times["queued"] >= released_at
+    if mode == "queued":
+        timing = queued["gateway_timing"]
+        assert timing["received_at"] == received["wall"]
+        assert timing["first_text_elapsed_ms"] >= (handler_times["queued"] - received["tick"]) * 1000
+        assert timing["first_text_elapsed_ms"] >= (released_at - received["tick"]) * 1000
+        assert timing["delivery_elapsed_ms"] >= timing["first_text_elapsed_ms"]
+    else:
+        assert queued["gateway_timing"] == {}
+    assert len(calls) == 2
+    assert len(adapter.sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["success", "failed_first", "skipped_edit", "draft_only", "no_receipt", "interim", "split", "prior_segment", "cumulative"])
+async def test_actual_send_edit_receipts_gate_first_text_without_changing_delivery(mode):
+    import time
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+    class ReceiptAdapter(Adapter):
+        async def edit_message(self, **kwargs):
+            self.sent.append(kwargs["content"])
+            return self.result
+
+        async def send_draft(self, **kwargs):
+            return self.result
+
+        async def send_stream_frame(self, text, **kwargs):
+            self.sent.append(text)
+            return self.result.success
+
+    adapter = ReceiptAdapter(SendResult(success=True, message_id="visible"))
+    consumer = GatewayStreamConsumer(adapter, "D_CLOCK", StreamConsumerConfig(cursor=""))
+    final = "Final answer with a verified receipt"
+    consumer.on_delta(final)
+    assert consumer.text_receipt_clock(final) is None
+    if mode == "draft_only":
+        consumer._draft_id = 123
+        await consumer._send_draft_frame(final)
+        assert consumer.text_receipt_clock(final) is None
+        assert consumer.text_receipt_clock(final, exact=True) is None
+        return
+    if mode == "no_receipt":
+        assert consumer.text_receipt_clock(final) is None
+        return
+    if mode == "cumulative":
+        consumer._use_native_streaming = True
+        consumer._native_stream_opened = True
+    prefix = "Interim tool commentary" if mode in {"interim", "cumulative"} else "Final"
+    if mode == "failed_first":
+        adapter.result = SendResult(success=False, error_kind="forbidden")
+    if mode == "split":
+        adapter.result = SendResult(success=True, message_id="tail", continuation_message_ids=("head",))
+    before = time.monotonic()
+    await consumer._send_or_edit(prefix, finalize=False)
+    after = time.monotonic()
+    initial = consumer.text_receipt_clock(final)
+    if mode in {"failed_first", "interim", "split", "cumulative"}:
+        assert initial is None
+    else:
+        assert before <= initial["tick"] <= after
+    if mode == "skipped_edit":
+        adapter.result = SendResult(success=True, message_id="visible", raw_response={"skipped": True})
+        await consumer._send_or_edit(final, finalize=True)
+        assert consumer.text_receipt_clock(final, exact=True) is None
+        assert consumer.text_receipt_clock(final) == initial
+    if mode in {"prior_segment", "cumulative"}:
+        consumer._accumulated = prefix
+        await consumer._end_segment(SimpleNamespace(update_visible=True))
+        assert consumer.text_receipt_clock(final) is None
+        initial = None
+    adapter.result = SendResult(success=True, message_id="complete")
+    before_final = time.monotonic()
+    sent_final = prefix + final if mode == "cumulative" else final
+    await consumer._send_or_edit(sent_final, finalize=True)
+    after_final = time.monotonic()
+    first_clock = consumer.text_receipt_clock(final)
+    final_clock = consumer.text_receipt_clock(final, exact=True)
+    assert first_clock is not None and final_clock is not None
+    assert before_final <= final_clock["tick"] <= after_final
+    if initial is None:
+        assert first_clock == final_clock
+    else:
+        assert first_clock == initial
+    assert first_clock["tick"] <= final_clock["tick"]
+    assert set(first_clock) == {"domain", "wall", "tick"}

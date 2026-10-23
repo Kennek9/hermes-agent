@@ -40,7 +40,9 @@ class StreamTransportMixin:
                     kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
-        return await self.adapter.edit_message(**kwargs)
+        result = await self.adapter.edit_message(**kwargs)
+        self._observe_text_receipt(content, result)
+        return result
 
     async def _try_seed_frame(self, fail_log: str, *, exc_info: bool = False) -> bool:
         """Open a native stream with an empty seed frame (typing indicator before any token) as a
@@ -177,6 +179,8 @@ class StreamTransportMixin:
             logger.debug("send_draft raised, disabling draft transport for this run: %s", e)
         else:
             if getattr(result, "success", False):
+                if self._stream_is_message():
+                    self._observe_text_receipt(text, result)
                 self._last_sent_text = text  # parity with the edit-based no-op skip
                 return True
             # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
@@ -287,6 +291,7 @@ class StreamTransportMixin:
             return False
         if not getattr(result, "success", False):
             return False
+        self._observe_text_receipt(text, result)
         new_message_id = getattr(result, "message_id", None)
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
@@ -391,6 +396,7 @@ class StreamTransportMixin:
                                  "send_stream_frame raised, disabling native streaming: %s"):
             self._already_sent = True
             self._last_sent_text = text
+            self._observe_text_receipt(text, True, native=True)
             self._native_last_pushed_len = len(text)
             if finalize:
                 self._mark_final_delivered()
@@ -454,6 +460,7 @@ class StreamTransportMixin:
         if not result.success:
             self._edit_supported = False
             return False
+        self._observe_text_receipt(text, result)
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:

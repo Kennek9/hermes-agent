@@ -27,6 +27,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            self._observe_text_receipt(text, result)
             if not (result.success and result.message_id):
                 self._edit_supported = False
                 return reply_to_id
@@ -225,6 +226,7 @@ class StreamFallbackMixin:
         result = None
         for attempt in range(2):
             result = await self.adapter.send(**kwargs)
+            self._observe_text_receipt(content, result)
             if getattr(result, "success", False):
                 break
             retry_delay = self._fallback_flood_retry_delay(result)
@@ -321,6 +323,7 @@ class StreamFallbackMixin:
             _md = dict(self.metadata) if self.metadata else {}
             _md["_interim_send"] = True
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
+            self._observe_text_receipt(tail, result)
             if result.success:
                 self._already_sent = True
         except Exception as e:
