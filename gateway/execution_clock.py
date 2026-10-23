@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 import math
+import os
 import time
 from uuid import uuid4
 
@@ -13,13 +14,19 @@ _MAX_RECEIPTS = 128
 
 
 def reading():
-    return {"domain": _DOMAIN, "wall": time.time(), "tick": time.monotonic()}
+    return {
+        "domain": _DOMAIN,
+        "process_id": os.getpid(),
+        "wall": time.time(),
+        "tick": time.monotonic(),
+    }
 
 
 def _valid(value):
     return (
         isinstance(value, dict)
         and value.get("domain") == _DOMAIN
+        and value.get("process_id") == os.getpid()
         and all(
             isinstance(value.get(k), (int, float))
             and not isinstance(value[k], bool)
@@ -71,7 +78,7 @@ class _Receipt:
 
 
 class TextClocks:
-    """Bound metadata to this consumer; retain earliest ACKs for final-text reconciliation."""
+    """Keep bounded receipt metadata for final-text reconciliation."""
 
     def __init__(self):
         self._receipts = []
@@ -80,7 +87,7 @@ class TextClocks:
         self._prior_segment = None
 
     def start_segment(self, visible_prefix=""):
-        """Tool boundaries exclude earlier narration, including cumulative transports."""
+        """Exclude earlier narration at structured tool boundaries."""
         self._receipts.clear()
         self._last = None
         self._overflowed = False
@@ -126,7 +133,7 @@ class TextClocks:
         self._receipts.append(self._last)
 
     def match(self, text, *, exact=False):
-        """Only ACKed characters belonging to the completed answer can define its first text."""
+        """Only ACKed characters of the completed answer define first text."""
         text = text.strip()
         if not text or self._overflowed:
             return None
@@ -174,7 +181,7 @@ def text_receipt(event, text, result):
 
 
 def timings(event, *, confirmed):
-    """Never subtract clocks from different processes or manufacture missing coverage."""
+    """Require one process clock and keep missing observations unknown."""
     start = getattr(event, "_execution_received_clock", None)
     identity = getattr(event, "_execution_observation", {})
     if (
