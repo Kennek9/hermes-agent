@@ -1,5 +1,7 @@
 """Run inside the patched Hermes test checkout, using its real platform dispatch."""
 
+import multiprocessing
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -431,4 +433,38 @@ async def test_actual_send_edit_receipts_gate_first_text_without_changing_delive
     else:
         assert first_clock == initial
     assert first_clock["tick"] <= final_clock["tick"]
-    assert set(first_clock) == {"domain", "wall", "tick"}
+    assert set(first_clock) == {"domain", "process_id", "wall", "tick"}
+
+
+def _send_child_clock(sender):
+    from gateway.execution_clock import reading
+    sender.send(reading())
+    sender.close()
+
+
+@pytest.mark.parametrize("start_method", multiprocessing.get_all_start_methods())
+def test_actual_child_process_receipt_cannot_measure_parent_turn_latency(start_method):
+    from gateway.execution_clock import receive, timings
+
+    event = MessageEvent(text="Synthetic process-boundary request")
+    receive(event)
+    context = multiprocessing.get_context(start_method)
+    receiver, sender = context.Pipe(duplex=False)
+    child = context.Process(target=_send_child_clock, args=(sender,))
+    child.start()
+    sender.close()
+    try:
+        assert receiver.poll(5), "clock child did not return a receipt"
+        foreign = receiver.recv()
+        child.join(5)
+        assert child.exitcode == 0
+        attach_execution(event, {"session_id": "process-session", "turn_id": "process-turn", "execution_first_text_clock": foreign})
+        measured = timings(event, confirmed=False)
+        assert "received_at" in measured
+        assert "first_text_elapsed_ms" not in measured
+        assert "delivery_elapsed_ms" not in measured
+    finally:
+        receiver.close()
+        if child.is_alive():
+            child.terminate()
+            child.join(5)
