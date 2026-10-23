@@ -3974,6 +3974,8 @@ class GatewayTurnMixin:
         if fail_result is not None and not getattr(_res, "success", True):
             logger.warning(fail_result, _sk, getattr(_res, "error", None))
             return
+        from gateway.execution_clock import stream_receipts
+        response.update(stream_receipts(_sc, content, _res))
         response["already_sent"] = True
         response["execution_delivery_confirmed"] = getattr(_res, "success", None) is True
         logger.info(*ok)
@@ -3991,6 +3993,8 @@ class GatewayTurnMixin:
         _final = response.get("final_response") or ""
         from gateway.execution_observer import confirm_streamed_text
         response["execution_delivery_confirmed"] = confirm_streamed_text(_sc, _final)
+        from gateway.execution_clock import stream_receipts
+        response.update(stream_receipts(_sc, _final))
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).

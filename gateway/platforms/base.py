@@ -1741,6 +1741,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
+    from gateway.execution_clock import invalidate
     existing = pending_messages.get(session_key)
     if existing:
         existing_type = getattr(existing, "message_type", None)
@@ -1759,6 +1760,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            invalidate(existing)
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -1777,6 +1779,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            invalidate(existing)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             return
@@ -2505,11 +2508,14 @@ class BasePlatformAdapter(ABC):
         """Buffer a text event (merging into a pending one) and restart the flush timer."""
         if self._drop_unresolved(event):
             return
+        from gateway.execution_clock import receive, invalidate
+        receive(event)
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
+            invalidate(existing)
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             if event.media_urls:
@@ -3782,6 +3788,8 @@ class BasePlatformAdapter(ABC):
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
+            from gateway.execution_clock import invalidate
+            invalidate(state.event)
             if event.text:
                 state.event.text = _append_text(state.event.text, event.text)
             latest_message_id = getattr(event, "message_id", None)
@@ -3950,6 +3958,8 @@ class BasePlatformAdapter(ABC):
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
+        from gateway.execution_clock import receive
+        receive(event)
         event._gateway_accepted = False
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
@@ -4271,6 +4281,8 @@ class BasePlatformAdapter(ABC):
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+        from gateway.execution_clock import text_receipt
+        text_receipt(event, text_content, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         event._execution_text_receipt = result
@@ -4439,6 +4451,8 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         event._execution_text_receipt = None
+        event._execution_final_clock = None
+        event._execution_first_final_clock = None
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
         def _record_delivery(result):

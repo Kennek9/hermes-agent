@@ -30,6 +30,7 @@ from gateway.config import (
 from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker)
+from gateway.execution_clock import TextClocks
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -120,6 +121,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None):
         self.adapter = adapter
+        self._text_clocks = TextClocks()
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
@@ -314,6 +316,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = True
         if record is not None:
             self._record_turn_final_payload(record)
+
+    def _observe_text_receipt(self, text, result, *, native=False):
+        # Cursor/fence cleanup follows the same display normalization as final matching.
+        if self.cfg.cursor and text.endswith(self.cfg.cursor):
+            text = text[:-len(self.cfg.cursor)]
+        self._text_clocks.record(self._display_payload(text), result, native=native)
+
+    def text_receipt_clock(self, final_text, *, exact=False):
+        return self._text_clocks.match(self._display_payload(final_text), exact=exact)
 
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""
@@ -913,6 +924,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if not cumulative:
             self._reset_segment_state()
         await self._send_commentary(commentary_text)
+        self._text_clocks.start_segment(
+            self._clean_for_display(self._accumulated).strip() if cumulative else "")
         self._last_edit_time = time.monotonic()
         if not cumulative:
             self._reset_segment_state()
@@ -925,6 +938,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must keep its sentinel or every tool boundary posts a new message; the
         continuation goes out once via _send_fallback_final."""
         if self._cumulative_transport():
+            self._text_clocks.start_segment(self._clean_for_display(self._accumulated).strip())
             return
         # If the segment-break edit or send didn't land (flood control / fallback mode, or a
         # failed first send of a split tail with no message id yet), _accumulated holds unseen
@@ -933,6 +947,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 and self._message_id != "__no_edit__"):
             await self._flush_segment_tail_on_edit_failure()
         self._reset_segment_state(preserve_no_edit=True)
+        self._text_clocks.start_segment()
 
     async def _on_cancelled(self) -> None:
         """Best-effort final edit on task cancel: finalize=True so REQUIRES_EDIT_FINALIZE

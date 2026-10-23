@@ -14,7 +14,12 @@ def attach_execution(event, result):
         or not result.get("turn_id")
     ):
         return
+    from gateway.execution_clock import invalidate
+    if result.get("queued_terminal_inbound_id"):
+        invalidate(event)
     event._execution_observation = {
+        "first_text_clock": result.get("execution_first_text_clock"),
+        "final_text_clock": result.get("execution_final_text_clock"),
         "session_id": result["session_id"],
         "turn_id": result["turn_id"],
         "generation_failed": result.get("failed") is True,
@@ -64,6 +69,7 @@ async def observe_delivery(event, result):
         outcome = "confirmed"
     try:
         from hermes_cli.lifecycle import invoke_hook
+        from gateway.execution_clock import timings
 
         await asyncio.to_thread(
             invoke_hook,
@@ -73,6 +79,8 @@ async def observe_delivery(event, result):
             outcome=outcome,
             generation_failed=identity.get("generation_failed", False),
             message_id=str(getattr(result, "message_id", "") or ""),
+            gateway_timing=timings(
+                event, confirmed=outcome == "confirmed"),
         )
     except Exception:
         logger.warning("Execution delivery observation failed")
