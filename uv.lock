@@ -19,7 +19,6 @@ aiohttp-socks = false
 aiosqlite = false
 alibabacloud-dingtalk = false
 anthropic = false
-anyio = false
 asyncpg = false
 azure-identity = false
 boto3 = false
