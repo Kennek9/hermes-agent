@@ -276,7 +276,7 @@ class AIAgent(
 
     def __init__(
         self,
-        base_url: str = None, api_key: str = None, provider: str = None, api_mode: str = None,
+        base_url: str = None, api_key: str = None, provider: str = None, api_mode: Optional[str] = None,
         acp_command: str = None, acp_args: list[str] | None = None, command: str = None, args: list[str] | None = None,
         model: str = "",
         max_iterations: int = sys.maxsize,  # unlimited tool-calling iterations by default (shared with subagents)
