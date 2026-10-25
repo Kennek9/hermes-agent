@@ -143,6 +143,9 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
 
 def _discovery_cache_path() -> Optional[Path]:
     """Path of the tool-discovery verdict cache, or None if unresolvable."""
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        return None
     try:
         # Deferred import keeps tools/registry.py a no-deps leaf at import time.
         from hermes_constants import get_hermes_home

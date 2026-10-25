@@ -439,6 +439,9 @@ def load_hermes_dotenv(
     terminal bridge. It requires ``load_external_secrets=False``; external source
     implementations do not provide a no-write contract.
     """
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        return []
     if read_only_files and load_external_secrets:
         raise ValueError("read_only_files requires load_external_secrets=False")
     # Process home on purpose (never the per-turn override): a startup .env load must not follow a routed

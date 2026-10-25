@@ -261,6 +261,9 @@ def _tool_defs_cache_key(
     registry generation, config.yaml stat signature (dynamic schemas), kanban
     context, profile scope. check_fn results are TTL-cached in the registry.
     """
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        return None
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
         return None

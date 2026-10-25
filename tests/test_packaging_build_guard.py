@@ -11,7 +11,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.CompletedProcess[str]:
+def _build_artifact(kind: str, tmp_path, *, nix_build: bool, library: bool = False) -> subprocess.CompletedProcess[str]:
     """Invoke the real PEP 517 hook (build_sdist / build_wheel) as a subprocess.
 
     The wheel and sdist guards live in SEPARATE cmdclass entries in setup.py
@@ -41,8 +41,8 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
         [
             sys.executable,
             "-c",
-            "from setuptools.build_meta import build_{kind}; build_{kind}(r'{out}')".format(
-                kind=kind, out=tmp_path
+            "from setuptools.build_meta import build_{kind}; build_{kind}(r'{out}', config_settings={settings!r})".format(
+                kind=kind, out=tmp_path, settings={"--build-option": ["--library"]} if library else None,
             ),
         ],
         cwd=PROJECT_ROOT,
@@ -59,5 +59,18 @@ def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path
 
     assert result.returncode != 0
     assert "Building wheels or sdists for hermes-agent is not supported" in result.stderr
+
+
+def test_explicit_library_wheel_contains_execution_resources(tmp_path):
+    import zipfile
+
+    result = _build_artifact("wheel", tmp_path, nix_build=False, library=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    wheel = next(tmp_path.glob("*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+    assert {"run_agent.py", "hermes_runtime.py", "hermes_platform/resources.py"} <= names
+    for directory in ("skills", "optional-skills", "optional-mcps", "locales", "assets"):
+        assert any(name.startswith(f"hermes_resources/{directory}/") for name in names), directory
 
 

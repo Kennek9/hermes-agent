@@ -60,6 +60,10 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
     Cached on the user + managed file signatures and the values of every referenced env var."""
+    from hermes_runtime import get_embedded_runtime
+    embedded = get_embedded_runtime()
+    if embedded is not None and (config_path is None or config_path == embedded.config_home / "config.yaml"):
+        return copy.deepcopy(embedded.user_config)
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)

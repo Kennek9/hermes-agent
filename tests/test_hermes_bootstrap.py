@@ -217,7 +217,7 @@ class TestEntryPointsImportBootstrap:
         assert child.stdout.splitlines()[-1] == '{"bootstrapped": false, "changed": []}'
 
     @pytest.mark.parametrize("path", ENTRY_POINTS)
-    def test_entry_point_imports_bootstrap(self, path):
+    def test_entry_point_imports_bootstrap(self, path, tmp_path):
         """The file must contain 'import hermes_bootstrap' and that
         line must appear before the first 'import' of anything else.
 
@@ -241,6 +241,22 @@ class TestEntryPointsImportBootstrap:
         repo_root = here.parent.parent  # tests/ -> repo root
         full_path = repo_root / path
         assert full_path.exists(), f"entry point missing: {full_path}"
+
+        if path == "run_agent.py":
+            # AIAgent is also a library import now. Its executable entry must still
+            # bootstrap before argparse, while the import stays covered by the
+            # embedded-runtime subprocess regression.
+            process_home = tmp_path / "standalone-home"
+            env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR") if key in os.environ}
+            env.update({"HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+                        "HERMES_HOME": str(process_home), "HERMES_DISABLE_LAZY_INSTALLS": "1"})
+            child = subprocess.run(
+                [sys.executable, str(full_path), "--help"], cwd=tmp_path, env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            assert child.returncode == 0, child.stderr
+            assert (process_home / "cache/scratch").is_dir()
+            return
 
         source = full_path.read_text(encoding="utf-8")
 

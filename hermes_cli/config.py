@@ -1907,6 +1907,10 @@ def _raw_config_cache_hit(path_key: str, cache_key: Tuple[Any, ...]) -> Optional
 
 
 def _read_raw_config_impl(*, want_deepcopy: bool, pure: bool = False) -> Dict[str, Any]:
+    from hermes_runtime import get_embedded_runtime
+    embedded = get_embedded_runtime()
+    if embedded is not None:
+        return copy.deepcopy(embedded.user_config) if want_deepcopy else embedded.user_config
     # Lock-free fast path for cache hits — same shape as `_load_config_impl`. `_RAW_CONFIG_CACHE`
     # publishes each entry as ONE `(*sig, data)` tuple replaced wholesale, so a reader sees either
     # the complete old entry or the complete new one; `_CONFIG_LOCK` only serializes the re-parse
@@ -2282,6 +2286,10 @@ def _load_config_cache_hit(path_key: str, cache_sig: Any) -> Optional[Dict[str, 
 
 
 def _load_config_impl(*, want_deepcopy: bool, pure: bool = False) -> Dict[str, Any]:
+    from hermes_runtime import get_embedded_runtime
+    embedded = get_embedded_runtime()
+    if embedded is not None:
+        return copy.deepcopy(embedded.config) if want_deepcopy else embedded.config
     # Lock-free fast path for cache hits — same publication contract as `_read_raw_config_impl`
     # above (whole-tuple replace, `_CONFIG_LOCK` only serializes rebuilds and writers). A hit costs
     # ~0.024ms; behind a lock held by `save_config()` the same read measured 10010ms, and on a

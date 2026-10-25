@@ -67,7 +67,8 @@ def _locales_dir() -> Path:
             "HERMES_BUNDLED_LOCALES points to a non-directory path (%s); "
             "falling back to bundled/source locale resolution", override,
         )
-    return Path(__file__).resolve().parent.parent / "locales"
+    from hermes_platform.resources import bundled_directory
+    return bundled_directory("locales")
 
 
 def _normalize_lang(value: Any) -> str:

@@ -697,6 +697,9 @@ def _init_turn_state(agent, run_budget_seconds):
 
 
 def _setup_logging(agent):
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        return  # The embedding host owns logging; do not attach process-wide file handlers.
     # agent.log (INFO+) + errors.log (WARNING+); idempotent so per-message gateway agents
     # don't duplicate handlers.
     from hermes_logging import setup_logging, setup_verbose_logging
@@ -1149,10 +1152,14 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
 
-    # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
-    agent.logs_dir = get_hermes_home() / "sessions"
+    # Standalone debug dumps use the home; embedded dumps belong to the invocation scratch.
+    from hermes_runtime import get_embedded_runtime
+    embedded = get_embedded_runtime()
+    agent.logs_dir = (embedded.scratch_dir if embedded else get_hermes_home()) / "sessions"
     agent.logs_dir.mkdir(parents=True, exist_ok=True)
     _set_defaults(agent, _SESSION_STATE)
+    if embedded is not None and session_db is None:
+        agent._persist_disabled = True
 
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager
@@ -1275,6 +1282,10 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         "memory" in (agent.enabled_toolsets or [])
         and "memory" not in (agent.disabled_toolsets or [])
     )
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        skip_memory = True
+        _memory_toolset_requested = False
     if not skip_memory or _memory_toolset_requested:
         # Memory is optional — don't break agent init
         with suppress(Exception):
@@ -2354,7 +2365,12 @@ def init_agent(
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
-    _install_safe_stdio()
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is None:
+        _install_safe_stdio()
+    else:
+        skip_memory = True
+        skip_background_review = True
 
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:

@@ -7,16 +7,17 @@
 """
 
 # hermes_bootstrap must be the very first import (UTF-8 stdio on Windows; no-op on POSIX).
-try:
-    import hermes_bootstrap  # noqa: F401
-except ModuleNotFoundError:
-    pass  # partial `hermes update` — only skips the Windows UTF-8 stdio setup
+if __name__ == "__main__":
+    try:
+        import hermes_bootstrap  # noqa: F401
+    except ModuleNotFoundError:
+        pass  # partial `hermes update` — only skips the Windows UTF-8 stdio setup
 
 import sys
 
 # `hermes-agent` runs this module without hermes_cli.main, which repairs a `hermes update` killed
 # while git wrote the new tree; do it here, before importing anything else from the checkout.
-if "hermes_cli.main" not in sys.modules:
+if __name__ == "__main__" and "hermes_cli.main" not in sys.modules:
     from hermes_cli import _early_recovery
 
     if _early_recovery.restore_interrupted_pull():
@@ -35,7 +36,8 @@ from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
+from hermes_runtime import get_embedded_runtime
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -118,15 +120,29 @@ from agent.iteration_budget import IterationBudget
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 
-_hermes_home = get_hermes_home()  # read by agent_init via _ra()._hermes_home
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent / '.env')
-for _env_path in _loaded_env_paths:
-    logger.info("Loaded environment variables from %s", _env_path)
-if not _loaded_env_paths:
-    logger.info("No .env file found. Using system environment variables.")
+_hermes_home = get_process_hermes_home()  # legacy process logging owner; never an embedded home
+_standalone_initialized = False
 
 
-from model_tools import get_toolset_for_tool
+def _initialize_standalone_runtime() -> None:
+    """Defer account loading until a standalone agent is actually constructed."""
+    global _standalone_initialized
+    if _standalone_initialized or get_embedded_runtime() is not None:
+        return
+    import hermes_bootstrap
+    hermes_bootstrap.initialize_process()
+    loaded = load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent / '.env')
+    for path in loaded:
+        logger.info("Loaded environment variables from %s", path)
+    _standalone_initialized = True
+
+
+def get_toolset_for_tool(tool_name: str) -> Optional[str]:
+    """Resolve tools lazily so importing AIAgent does not initialize tool state."""
+    from model_tools import get_toolset_for_tool as resolve
+    return resolve(tool_name)
+
+
 from tools.terminal_tool_lifecycle import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool_lifecycle import cleanup_browser
@@ -307,7 +323,11 @@ class AIAgent(
             warnings.warn("tool_delay is deprecated and ignored; sequential tool calls "
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
         from agent.agent_init import init_agent
+        _initialize_standalone_runtime()
         init_agent(self, **init_kwargs)
+        if get_embedded_runtime() is None:
+            from tools.process_registry import process_registry
+            process_registry.restore_durable_completions()
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the

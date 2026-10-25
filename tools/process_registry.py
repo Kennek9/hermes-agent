@@ -617,11 +617,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
         # Rehydrate durable delegation completions once, at registry startup.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        self._durable_completions_restored = False
+        self.restore_durable_completions()
         # Completions the agent already consumed via wait()/read_log() (output in
         # hand): drain loops AND gateway/tui watchers skip them.
         self._completion_consumed: set = set()
@@ -644,6 +641,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._heartbeat_thread: Optional[threading.Thread] = None
 
     # ── heartbeat ───────────────────────────────────────────────────────────
+    def restore_durable_completions(self) -> None:
+        """Restore standalone notifications once; embedded hosts own durable delivery."""
+        from hermes_runtime import get_embedded_runtime
+        if self._durable_completions_restored or get_embedded_runtime() is not None:
+            return
+        self._durable_completions_restored = True
+        try:
+            from tools.async_delegation import restore_undelivered_completions
+            restore_undelivered_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore async delegation completions: %s", exc)
+
     def arm_heartbeat(self, session: ProcessSession, seconds: int) -> int:
         """Enable periodic heartbeat events for ``session``; returns the effective interval."""
         seconds = max(int(seconds), HEARTBEAT_MIN_SECONDS)

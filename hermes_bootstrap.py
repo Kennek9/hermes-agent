@@ -444,10 +444,18 @@ def export_scratch_tmp_env() -> None:
         pass  # a missing/unwritable home just leaves the system temp dir in place
 
 
-# Apply on import — entry points only need ``import hermes_bootstrap`` first.
-apply_windows_utf8_bootstrap()
-suppress_platform_ver_console()
-install_never_free_environ()
-activate_durable_lazy_target()
-install_happy_eyeballs_socket_connect()
-export_scratch_tmp_env()
+def initialize_process() -> None:
+    """Bootstrap standalone entry points; an embedding host owns its process settings."""
+    runtime_module = sys.modules.get("hermes_runtime")
+    if runtime_module is not None and runtime_module.get_embedded_runtime() is not None:
+        return
+    apply_windows_utf8_bootstrap()
+    suppress_platform_ver_console()
+    install_never_free_environ()
+    activate_durable_lazy_target()
+    install_happy_eyeballs_socket_connect()
+    export_scratch_tmp_env()
+
+
+# Entry points retain import-time bootstrap; embedded imports remain side-effect free.
+initialize_process()

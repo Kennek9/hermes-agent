@@ -83,6 +83,9 @@ def set_current_session_id(session_id: str) -> None:
     with an os.environ fallback).  Delegated subagent children (built in the parent process)
     get ONLY the task-local write, or they would clobber the parent's id."""
     _SESSION_ID.set(session_id)
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None:
+        return
     try:
         from agent.delegation_context import is_delegated_child_context
         if is_delegated_child_context():

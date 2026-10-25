@@ -732,6 +732,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     timestamp line, runtime environment hints).  Worktree-dependent blocks follow project context so a
     shared context file can remain in the longest common prefix across worktrees.
     Never re-rendered mid-session."""
+    from hermes_runtime import get_embedded_runtime
+    if get_embedded_runtime() is not None and system_message is not None:
+        # The host freezes the complete conversation prefix, including its own tools,
+        # memory and environment. Per-invocation scratch paths must not rewrite it.
+        return {"stable": system_message, "context": "", "volatile": ""}
     # Model context window scales the context-file caps; stable per conversation.
     _cc_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None

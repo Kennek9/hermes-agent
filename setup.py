@@ -1,5 +1,5 @@
 """
-setup.py — wheel/sdist build guard.
+setup.py — standalone distribution guard and explicit execution-library wheel.
 
 pip/PyPI and Homebrew are no longer supported distribution methods for
 Hermes Agent (see website/docs/getting-started/platform-support.md). The
@@ -8,16 +8,19 @@ web_dist, tui_dist, plugin manifests) since those are resolved at runtime
 via env-var overrides set by the nix wrapper or the source-checkout layout.
 
 This file overrides the ``bdist_wheel`` and ``sdist`` setuptools commands
-to raise an error when run outside a Nix build. The PEP 517
+to reject standalone artifacts outside a Nix build. An embedding host may request
+the supported execution-library wheel with the PEP 517 config setting
+``--build-option=--library``; its build_py command includes execution resources.
+The PEP 517
 ``build_wheel`` / ``build_sdist`` hooks in
 ``setuptools.build_meta`` call these commands internally, so the guard
 fires for ``uv build``, ``pip wheel``, ``python -m build``, and direct
 ``setup.py`` invocations alike.
 
-The one legitimate consumer of ``build_wheel`` is uv2nix, which calls
+The existing standalone consumer of ``build_wheel`` is uv2nix, which calls
 ``setuptools.build_meta.build_wheel`` (→ ``bdist_wheel``) inside a Nix
 build sandbox. ``nix/python.nix`` sets ``HERMES_NIX_BUILD=1`` on the
-Hermes package derivation, so only that build may create an artifact.
+Hermes package derivation, so only that build may create a standalone artifact.
 
 Editable installs (``uv sync``, ``pip install -e .``, ``nix develop``)
 use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
@@ -25,9 +28,12 @@ use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
 """
 
 import os
+import shutil
+from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.sdist import sdist
+from setuptools.command.build_py import build_py
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,7 +59,23 @@ class _GuardedSdist(sdist):
         return super().run(*args, **kwargs)
 
 
-cmdclass = {"sdist": _GuardedSdist}
+class _LibraryBuildPy(build_py):
+    """Keep execution assets beside the installed modules in an explicit library wheel."""
+
+    def run(self):
+        super().run()
+        wheel_command = self.distribution.get_command_obj("bdist_wheel")
+        if not getattr(wheel_command, "library", False):
+            return
+        resources = Path(self.build_lib) / "hermes_resources"
+        for name in ("assets", "locales", "skills", "optional-skills", "optional-mcps"):
+            shutil.copytree(
+                Path(_ROOT) / name, resources / name, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
+            )
+
+
+cmdclass = {"sdist": _GuardedSdist, "build_py": _LibraryBuildPy}
 
 # bdist_wheel is only available when the `wheel` package is installed.
 # setuptools.build_meta.build_wheel() calls it internally, so the guard
@@ -64,8 +86,17 @@ try:
     from setuptools.command.bdist_wheel import bdist_wheel
 
     class _GuardedBdistWheel(bdist_wheel):
+        user_options = bdist_wheel.user_options + [
+            ("library", None, "build an execution library with bundled runtime assets"),
+        ]
+        boolean_options = bdist_wheel.boolean_options + ["library"]
+
+        def initialize_options(self):
+            super().initialize_options()
+            self.library = False
+
         def run(self, *args, **kwargs):
-            if not _IN_NIX_BUILD:
+            if not _IN_NIX_BUILD and not self.library:
                 raise RuntimeError(_BLOCK_MESSAGE)
             return super().run(*args, **kwargs)
 

@@ -393,7 +393,15 @@ def _packaged_dir(env_var: str, default: Path | None, subdir: str) -> Path:
     ``<HERMES_HOME>/<subdir>``.
     """
     override = os.getenv(env_var, "").strip()
-    return Path(override) if override else default if default is not None else get_hermes_home() / subdir
+    if override:
+        return Path(override)
+    if default is not None and default.is_dir():
+        return default
+    from hermes_platform.resources import bundled_directory
+    packaged = bundled_directory(subdir)
+    if packaged.parent.name == "hermes_resources":
+        return packaged
+    return default if default is not None else get_hermes_home() / subdir
 
 
 def get_optional_skills_dir(default: Path | None = None) -> Path:
@@ -1206,6 +1214,10 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
     """
+    from hermes_runtime import get_embedded_runtime
+    embedded = get_embedded_runtime()
+    if embedded is not None:
+        return embedded.scratch_dir
     base = Path(home) if home is not None else get_hermes_home()
     scratch = base / "cache" / "scratch"
     try:
