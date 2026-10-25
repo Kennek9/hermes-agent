@@ -97,7 +97,7 @@ class TerminalEnvironmentProvider(ProviderBase):
     def create_environment(
         self, *, cwd: str, timeout: int, task_id: str = "default", image: Optional[str] = None,
         container_config: Optional[Dict[str, Any]] = None, **kwargs: Any,
-    ):
+    ) -> Any:
         """Create an execution environment (``BaseEnvironment`` duck type). MUST accept ``**kwargs`` and ignore
         unknown keys so the factory can evolve without breaking older plugins. ``task_id`` keys reuse/persistence;
         ``container_config`` carries ``container_cpu/memory/disk/persistent`` when :attr:`is_container`."""
