@@ -43,7 +43,8 @@ async def test_action_legacy_names_and_optional_client():
     assert ack.await_count==3
 
 @pytest.mark.asyncio
-async def test_ambient_source_arrives_even_when_reply_is_suppressed():
+@pytest.mark.parametrize("remote_file", [False, True])
+async def test_ambient_source_arrives_even_when_reply_is_suppressed(remote_file):
     from unittest.mock import MagicMock
     adapter=SlackAdapter(PlatformConfig(enabled=False))
     adapter._bot_user_id="U_BOT"
@@ -57,9 +58,17 @@ async def test_ambient_source_arrives_even_when_reply_is_suppressed():
     adapter.set_platform_event_handler(observed)
     event={"type":"message","text":"方案A因成本高放弃","user":"U_A","channel":"C_A",
            "channel_type":"channel","ts":"1790570000.000001","client_msg_id":"synthetic"}
+    if remote_file:
+        event.update(subtype="file_share", text="", files=[{
+            "is_external": True,
+            "external_url": "https://docs.google.com/document/d/native-share/edit",
+        }])
     await adapter._handle_slack_message(event,{"team_id":"T_A","event_id":"Ev1"})
     assert observed.await_count==1
     envelope,_=observed.await_args.args
     assert envelope["event_type"]=="message_received"
     assert envelope["payload"]["event_kind"]=="created"
+    if remote_file:
+        assert envelope["payload"]["files"] == event["files"]
+        assert envelope["payload"]["content"] == ""
     adapter.handle_message.assert_not_awaited()
