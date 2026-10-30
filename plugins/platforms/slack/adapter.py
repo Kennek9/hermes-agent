@@ -17,6 +17,10 @@ from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, Li
 
 import aiohttp
 
+from plugins.platforms.slack.message_sources import (
+    message_files, nested_message_blocks, retained_attachments,
+)
+
 try:
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -604,22 +608,17 @@ def _render_slack_table_block(
     return text
 
 
-def _extract_text_from_slack_attachments(attachments: list) -> str:
+def _extract_text_from_slack_attachments(attachments: list, bot_uid: str = "") -> str:
     """Extract readable text from legacy ``attachments`` (alert/CI bots post empty ``text``).
     Prefers structured fields; uses ``fallback`` only when nothing else exists."""
     if not attachments:
         return ""
     lines: list[str] = []
-    for att in attachments:
-        if not isinstance(att, dict):
-            continue
-        # Permalink unfurls repeat a message the agent already reads (inbound path skips them too).
-        if att.get("is_msg_unfurl"):
-            continue
+    for att in retained_attachments(attachments, bot_uid):
         got: list[str] = [str(att[key]) for key in ("pretext", "title", "text") if att.get(key)]
-        for field in att.get("fields", []) or []:
-            if isinstance(field, dict):
-                got += [str(field[k]) for k in ("title", "value") if field.get(k)]
+        for attachment_field in att.get("fields", []) or []:
+            if isinstance(attachment_field, dict):
+                got += [str(attachment_field[k]) for k in ("title", "value") if attachment_field.get(k)]
         block_text = _extract_text_from_slack_blocks(att.get("blocks")) if att.get("blocks") else ""
         if block_text:
             got.append(block_text)
@@ -4275,20 +4274,18 @@ class SlackAdapter(BasePlatformAdapter):
         return normalized_event
 
     @staticmethod
-    def _append_link_unfurls(text: str, slack_attachments: list) -> str:
-        """Append link-unfurl previews (``attachments``) to ``text``; ``is_msg_unfurl`` echoes our
-        own content and is skipped. Dedup matches the rendered section, not the bare URL (which is
+    def _append_link_unfurls(text: str, slack_attachments: list, bot_uid: str = "") -> str:
+        """Append link previews, skipping only positively identified self echoes.
+        Dedup matches the rendered section, not the bare URL (which is
         usually already in the user's text while the preview body is not)."""
         att_parts: list[str] = []
         blocks_budget = _SLACK_UNFURL_BLOCKS_MAX_CHARS
-        for att in slack_attachments:
+        for att in retained_attachments(slack_attachments, bot_uid):
             att_title = att.get("title", "")
             att_url = att.get("title_link", "") or att.get("from_url", "")
             att_text = att.get("text", "")
             att_footer = att.get("footer", "")
             att_fallback = att.get("fallback", "")
-            if att.get("is_msg_unfurl"):
-                continue
             if att_title and att_url:
                 header = f"📎 [{att_title}]({att_url})"
             else:
@@ -4451,6 +4448,15 @@ class SlackAdapter(BasePlatformAdapter):
         self._reacting_message_ids.add(self._workspace_message_marker(team_id, ts))
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
 
+    def _message_source_payload(self, message: dict, bot_uid: str) -> dict:
+        """Keep mentions in captured source text while dropping this bot's own echoes."""
+        visible = {**message, "attachments": retained_attachments(message.get("attachments"), bot_uid)}
+        return {
+            "content": self._render_message_text(visible),
+            "files": message_files(message, bot_uid),
+            "nested_blocks": nested_message_blocks(message, bot_uid),
+        }
+
     async def _emit_message_created_event(self, event: dict, payload: Optional[dict] = None) -> None:
         """Observe authorized human messages independently of whether they wake a chat."""
         handler = getattr(self, "_platform_event_handler", None)
@@ -4482,8 +4488,8 @@ class SlackAdapter(BasePlatformAdapter):
             await handler({"platform":"slack", "event_type":"message_received", "payload":{
                 "workspace_id":team,"user_id":user,"channel_id":channel,"chat_type":chat_type,
                 "message_id":message,"thread_root_ts":event.get("thread_ts") or message,"event_id":event_id,"occurred_at":occurred,
-                "event_kind":"created","content":event["text"],"source_url":"",
-                "files":event.get("files", []),
+                "event_kind":"created","source_url":"",
+                **self._message_source_payload(event, self._team_bot_user_ids.get(team) or ""),
             }}, source)
         except Exception:
             logger.warning("[Slack] message source observer failed")
@@ -4566,8 +4572,8 @@ class SlackAdapter(BasePlatformAdapter):
             "occurred_at": occurred, "event_kind": event_kind,
         }}
         if kind == "message_changed":
-            normalized["payload"]["content"] = content
-            normalized["payload"]["files"] = message.get("files", [])
+            bot_uid = self._team_bot_user_ids.get(workspace) or ""
+            normalized["payload"].update(self._message_source_payload(message, bot_uid))
         try:
             await handler(normalized, source)
         except Exception:
@@ -4749,7 +4755,9 @@ class SlackAdapter(BasePlatformAdapter):
         if blocks and not is_command_text:
             text = self._append_block_text(
                 text, blocks, self._team_bot_user_ids.get(dedup_team_id, self._bot_user_id) or "")
-        text = self._append_link_unfurls(text, event.get("attachments") or [])
+        text = self._append_link_unfurls(
+            text, event.get("attachments") or [],
+            self._team_bot_user_ids.get(dedup_team_id, self._bot_user_id) or "")
         ts = event.get("ts", "")
         outer_team_id = dedup_team_id
         assistant_meta = self._lookup_assistant_thread_metadata(
@@ -5018,7 +5026,7 @@ class SlackAdapter(BasePlatformAdapter):
         media_types = list(thread_root_media_types)
         media_text_inlined: List[bool] = [False] * len(media_urls)
         notices: List[str] = []
-        for f in event.get("files", []):
+        for f in message_files(event, self._team_bot_user_ids.get(team_id, self._bot_user_id) or ""):
             if f.get("file_access") == "check_file_info":
                 f = await self._resolve_file_stub(f, channel_id, team_id, notices)
                 if f is None:
@@ -5912,7 +5920,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Legacy ``attachments``: alerting/CI bots often post empty ``text`` with
         # the real content in attachment fields or nested blocks.
         attachments = msg.get("attachments") or []
-        attachments_text = _extract_text_from_slack_attachments(attachments).strip()
+        attachments_text = _extract_text_from_slack_attachments(attachments, bot_uid).strip()
         if attachments_text and _unseen(attachments_text, msg_text):
             extras.append(attachments_text)
         if blocks:
@@ -5925,7 +5933,7 @@ class SlackAdapter(BasePlatformAdapter):
                 extras.append("URLs: " + ", ".join(new_urls))
         # File markers: thread context is text-only, so otherwise "the chart above" refers to
         # nothing (thread-root images are delivered separately, _collect_thread_root_images).
-        files = msg.get("files") if isinstance(msg.get("files"), list) else []
+        files = message_files(msg, bot_uid)
         markers = [_slack_file_marker(f) for f in files if isinstance(f, dict)]
         if markers:
             extras.append(" ".join(markers))
@@ -6155,7 +6163,7 @@ class SlackAdapter(BasePlatformAdapter):
             cached = self._thread_context_cache.get(
                 self._thread_cache_key(channel_id, thread_ts, team_id))
             root = self._thread_root_message(cached.messages, thread_ts) if cached else None
-            files = root.get("files") if root else None
+            files = message_files(root, self._team_bot_user_ids.get(team_id, self._bot_user_id) or "") if root else None
             if not isinstance(files, list):
                 return media_urls, media_types
             for f in files:
