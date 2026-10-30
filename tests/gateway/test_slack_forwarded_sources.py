@@ -123,3 +123,22 @@ def test_quote_metadata_never_claims_the_forwarding_speaker(message):
     assert nested_message_blocks({**message, "user": "U_QUOTER"}) == [
         {"kind": "quote", "author_id": None, "channel_id": None, "ts": None}
     ]
+
+
+@pytest.mark.parametrize(
+    ("outer", "forward_only"),
+    [
+        ({"text": ""}, True),
+        ({"text": "Please check this first"}, False),
+        ({"text": "", "blocks": [{"type": "image", "alt_text": "additional context"}]}, False),
+        ({"text": "", "files": [{"id": "F_COMMENT", "name": "context.pdf"}]}, False),
+    ],
+)
+def test_capture_marks_only_unambiguous_forward_only_events(outer, forward_only):
+    adapter = SlackAdapter(PlatformConfig(enabled=True))
+    message = {**outer, "attachments": [{"is_share": True, "author_id": "U_ORIGINAL",
+        "channel_id": "C_ORIGINAL", "ts": "100.000001", "text": "Original source content"}]}
+    payload = adapter._message_source_payload(message, "U_BOT")
+    assert payload.get("forward_only", False) is forward_only
+    assert "Original source content" in payload["content"]
+    assert payload["nested_blocks"][0]["author_id"] == "U_ORIGINAL"
