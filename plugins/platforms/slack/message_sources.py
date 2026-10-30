@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 
 def retained_attachments(attachments: object, bot_uid: str = "") -> list[dict]:
     """Only an attachment positively attributed to this bot is its own message echo."""
@@ -79,3 +81,111 @@ def nested_message_blocks(message: dict, bot_uid: str = "") -> list[dict]:
             "ts": None,
         })
     return refs
+
+
+def speaker_projection(
+    message: dict,
+    bot_uid: str,
+    render_text: Callable[[dict], str],
+    render_attachment: Callable[[list, str], str],
+) -> tuple[str, list[dict]]:
+    """Bind ranges while assembling source parts, rather than matching repeated text later."""
+    sender = message.get("user") if isinstance(message.get("user"), str) else None
+    pieces: list[tuple[str, str, str | None, list[str | None]]] = []
+
+    def append(
+        text: str, kind: str, author: str | None, chain: list[str | None]
+    ) -> None:
+        lines: list[str] = []
+        previous = None
+        for line in text.strip().splitlines():
+            quoted = kind == "quote" or line.lstrip().startswith(">")
+            if previous is not None and quoted != previous:
+                pieces.append((
+                    "\n".join(lines),
+                    "quote" if previous else kind,
+                    None if previous else author,
+                    chain + [None] if previous else chain,
+                ))
+                lines = []
+            lines.append(line)
+            previous = quoted
+        if lines:
+            pieces.append((
+                "\n".join(lines),
+                "quote" if previous else kind,
+                None if previous else author,
+                chain + [None] if previous else chain,
+            ))
+
+    blocks = message.get("blocks") or []
+    has_rich_quote = any(
+        element.get("type") == "rich_text_quote"
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "rich_text"
+        for element in block.get("elements", [])
+        if isinstance(element, dict)
+    )
+    if has_rich_quote:
+        # Slack's notification fallback may flatten author boundaries; keep it as unknown
+        # while the original structured parts retain their own source identities.
+        append(str(message.get("text") or ""), "unknown", None, [sender, None])
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "rich_text":
+                for element in block.get("elements", []):
+                    text = render_text({
+                        "text": "",
+                        "blocks": [{"type": "rich_text", "elements": [element]}],
+                    })
+                    quote = element.get("type") == "rich_text_quote"
+                    append(
+                        text,
+                        "quote" if quote else "message",
+                        None if quote else sender,
+                        [sender],
+                    )
+            else:
+                append(
+                    render_text({"text": "", "blocks": [block]}),
+                    "message",
+                    sender,
+                    [sender],
+                )
+    else:
+        append(
+            render_text({**message, "attachments": [], "files": []}),
+            "message",
+            sender,
+            [sender],
+        )
+    for item in retained_attachments(message.get("attachments"), bot_uid):
+        author = (
+            item.get("author_id")
+            if isinstance(item.get("author_id"), str) and item["author_id"]
+            else None
+        )
+        kind = (
+            "forward"
+            if item.get("is_share") or item.get("is_msg_unfurl")
+            else "unknown"
+        )
+        append(render_attachment([item], bot_uid), kind, author, [sender, author])
+    content, spans = "", []
+    for text, kind, author, chain in pieces:
+        if not text:
+            continue
+        if content:
+            content += "\n"
+        start = len(content)
+        content += text
+        spans.append({
+            "start": start,
+            "end": len(content),
+            "kind": kind,
+            "sender_id": sender,
+            "author_id": author,
+            "author_chain": chain,
+        })
+    return content, spans
