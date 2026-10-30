@@ -18,7 +18,7 @@ from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, Li
 import aiohttp
 
 from plugins.platforms.slack.message_sources import (
-    message_files, nested_message_blocks, retained_attachments,
+    message_files, nested_message_blocks, retained_attachments, speaker_projection,
 )
 
 try:
@@ -4451,8 +4451,13 @@ class SlackAdapter(BasePlatformAdapter):
     def _message_source_payload(self, message: dict, bot_uid: str) -> dict:
         """Keep mentions in captured source text while dropping this bot's own echoes."""
         visible = {**message, "attachments": retained_attachments(message.get("attachments"), bot_uid)}
+        content, speakers = speaker_projection(
+            visible, bot_uid, lambda value: self._render_message_text(value, include_files=False),
+            _extract_text_from_slack_attachments,
+        )
         return {
-            "content": self._render_message_text(visible, include_files=False),
+            "content": content,
+            "speaker_blocks": speakers,
             "files": message_files(message, bot_uid),
             "nested_blocks": nested_message_blocks(message, bot_uid),
         }
