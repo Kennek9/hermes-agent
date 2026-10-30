@@ -4452,7 +4452,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Keep mentions in captured source text while dropping this bot's own echoes."""
         visible = {**message, "attachments": retained_attachments(message.get("attachments"), bot_uid)}
         return {
-            "content": self._render_message_text(visible),
+            "content": self._render_message_text(visible, include_files=False),
             "files": message_files(message, bot_uid),
             "nested_blocks": nested_message_blocks(message, bot_uid),
         }
@@ -5891,7 +5891,7 @@ class SlackAdapter(BasePlatformAdapter):
     # ----- Thread context fetching -----
 
     @staticmethod
-    def _render_message_text(msg: dict, bot_uid: str = "") -> str:
+    def _render_message_text(msg: dict, bot_uid: str = "", *, include_files: bool = True) -> str:
         """Display text for a message: ``text`` minus bot mentions plus readable block/attachment
         text, URLs and file markers (no JSON dump, unlike ``_serialize_slack_blocks_for_agent``)."""
         msg_text = (msg.get("text") or "").strip()
@@ -5933,7 +5933,7 @@ class SlackAdapter(BasePlatformAdapter):
                 extras.append("URLs: " + ", ".join(new_urls))
         # File markers: thread context is text-only, so otherwise "the chart above" refers to
         # nothing (thread-root images are delivered separately, _collect_thread_root_images).
-        files = message_files(msg, bot_uid)
+        files = message_files(msg, bot_uid) if include_files else []
         markers = [_slack_file_marker(f) for f in files if isinstance(f, dict)]
         if markers:
             extras.append(" ".join(markers))

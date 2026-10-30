@@ -71,6 +71,7 @@ async def test_created_and_edited_capture_preserve_forward_body_files_and_source
     assert "<@U_BOT>" in created["content"]
     assert created["user_id"] == "U_FORWARDER"
     assert created["files"] == attachment["files"]
+    assert "source.pdf" not in created["content"]
     assert created["nested_blocks"] == [
         {
             "kind": "forward",
