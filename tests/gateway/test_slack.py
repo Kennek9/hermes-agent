@@ -5058,19 +5058,20 @@ class TestSlackAuthoredTextDeduplication:
         assert rendered.count("do you see") == 1
 
     def test_hydration_skips_message_unfurl_attachment(self, adapter):
-        """A permalink unfurl echoes the *linked* message — the live path
-        already skips it, so hydration must not re-append it either."""
+        """An unfurl positively attributed to this bot is its own message echo."""
         rendered = adapter._render_message_text(
             {
                 "text": f"<{_THREAD_PERMALINK_ESCAPED}>",
                 "attachments": [
                     {
                         "is_msg_unfurl": True,
+                        "author_id": "U_BOT",
                         "text": "the linked message body",
                         "fallback": "linked message fallback",
                     }
                 ],
-            }
+            },
+            bot_uid="U_BOT",
         )
 
         assert "the linked message body" not in rendered
@@ -5082,10 +5083,11 @@ class TestSlackAuthoredTextDeduplication:
             {
                 "text": "",
                 "attachments": [
-                    {"is_msg_unfurl": True, "text": "echoed message body"},
+                    {"is_msg_unfurl": True, "author_id": "U_BOT", "text": "echoed message body"},
                     {"title": "FiringAlert", "text": "disk usage 95%"},
                 ],
-            }
+            },
+            bot_uid="U_BOT",
         )
 
         assert "echoed message body" not in rendered
