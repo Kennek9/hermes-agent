@@ -4451,10 +4451,16 @@ class SlackAdapter(BasePlatformAdapter):
     def _message_source_payload(self, message: dict, bot_uid: str) -> dict:
         """Keep mentions in captured source text while dropping this bot's own echoes."""
         visible = {**message, "attachments": retained_attachments(message.get("attachments"), bot_uid)}
+        nested = nested_message_blocks(message, bot_uid)
+        # Unknown Block Kit content or an added file must not be suppressed as a repeated forward.
+        forward_only = (any(block["kind"] == "forward" for block in nested)
+                        and message.get("text") in (None, "")
+                        and not message.get("blocks") and not message.get("files"))
         return {
             "content": self._render_message_text(visible, include_files=False),
             "files": message_files(message, bot_uid),
-            "nested_blocks": nested_message_blocks(message, bot_uid),
+            "nested_blocks": nested,
+            **({"forward_only": True} if forward_only else {}),
         }
 
     async def _emit_message_created_event(self, event: dict, payload: Optional[dict] = None) -> None:
