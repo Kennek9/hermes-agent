@@ -18,7 +18,7 @@ from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, Li
 import aiohttp
 
 from plugins.platforms.slack.message_sources import (
-    message_files, nested_message_blocks, retained_attachments,
+    message_files, nested_message_blocks, retained_attachments, speaker_projection,
 )
 
 try:
@@ -4456,8 +4456,13 @@ class SlackAdapter(BasePlatformAdapter):
         forward_only = (any(block["kind"] == "forward" for block in nested)
                         and message.get("text") in (None, "")
                         and not message.get("blocks") and not message.get("files"))
+        content, speakers = speaker_projection(
+            visible, bot_uid, lambda value: self._render_message_text(value, include_files=False),
+            _extract_text_from_slack_attachments,
+        )
         return {
-            "content": self._render_message_text(visible, include_files=False),
+            "content": content,
+            "speaker_blocks": speakers,
             "files": message_files(message, bot_uid),
             "nested_blocks": nested,
             **({"forward_only": True} if forward_only else {}),
