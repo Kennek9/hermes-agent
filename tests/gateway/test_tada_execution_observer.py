@@ -313,8 +313,8 @@ async def test_inbound_clock_includes_real_queue_wait_and_does_not_reassign_ambi
     def observed(name, **kwargs):
         if name == "gateway_delivery":
             calls.append(kwargs)
-            if kwargs["turn_id"] == "queued-turn":
-                # Hook runs in a worker thread; notify the original loop safely.
+            if len(calls) == 2:
+                # Both hooks run in worker threads; queued completion can arrive first.
                 loop.call_soon_threadsafe(delivered.set)
 
     monkeypatch.setattr(hermes_cli.lifecycle, "invoke_hook", observed)
