@@ -43,6 +43,14 @@ def test_selected_legacy_payload_cannot_return_from_cached_transcript(tmp_path):
         assert "LEGACY_REPLAY_722" not in json.dumps(db.get_messages("legacy-retired"))
         assert next(row for row in before if row['id']==later)['content']=='Keep the later confirmation'
         assert db.get_messages("unselected-session")[0]['content']=='Keep the other session'
+        db.create_session("already-compressed", "cli")
+        old = db.append_message("already-compressed", "user", "Old compressed source")
+        db.end_session("already-compressed", "compression")
+        db.erase_message_payloads("already-compressed", [old], allow_legacy=True,
+            retire_session_scope=True)
+        assert db.get_session("already-compressed")["end_reason"] == "compression"
+        with pytest.raises(ValueError, match="session_scope_retired"):
+            db.append_message("already-compressed", "assistant", "Refuse a stale compressed writer")
 
 
 def test_retired_legacy_session_routes_new_input_to_fresh_history_and_neutralizes_late_files(

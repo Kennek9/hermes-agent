@@ -50,8 +50,8 @@ def prepare_archive_rows(messages, state_path: Path, *, session_id=None):
         with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             connection.execute("BEGIN")
             scoped = bool(session_id and connection.execute(
-                "SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
-                (session_id,)).fetchone())
+                "SELECT 1 FROM erased_message_origins WHERE origin_key=?",
+                (SessionMessagesMixin._session_scope_key(session_id),)).fetchone())
             prepared = []
             for message in messages:
                 if not isinstance(message, dict):
@@ -61,8 +61,8 @@ def prepare_archive_rows(messages, state_path: Path, *, session_id=None):
                     message.get("display_metadata")) or {}
                 host_session = message.get("session_id") or metadata.get("_hermes_session_id")
                 if (scoped or host_session and connection.execute(
-                        "SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
-                        (host_session,)).fetchone()) and metadata.get(
+                        "SELECT 1 FROM erased_message_origins WHERE origin_key=?",
+                        (SessionMessagesMixin._session_scope_key(host_session),)).fetchone()) and metadata.get(
                             "_hermes_archive_profile", profile_key) == profile_key:
                     prepared.append(_cleared_archive_value(message, metadata))
                     continue

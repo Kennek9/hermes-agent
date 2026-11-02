@@ -129,9 +129,16 @@ class SessionMessagesMixin:
         return json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
+    def _session_scope_key(session_id):
+        return SessionMessagesMixin._origin_key({"scope": "session", "session_id": session_id})
+
+    @staticmethod
     def _check_retired_session_scope(conn, session_id):
-        if conn.execute("SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
-                        (session_id,)).fetchone():
+        retired = conn.execute(
+            "SELECT 1 FROM erased_message_origins WHERE origin_key=?",
+            (SessionMessagesMixin._session_scope_key(session_id),),
+        ).fetchone()
+        if retired:
             raise ValueError("session_scope_retired")
 
     @staticmethod
@@ -1650,7 +1657,7 @@ class SessionMessagesMixin:
         """Clear selected SQLite payloads while retaining message IDs and tool-call pairing.
 
         The caller owns authorization and explicit scope approval. Legacy rows require a separate
-        opt-in; an origin mismatch always rejects. A known origin must be selected completely in this
+        opt-in; ordinary origin-scoped erasure rejects an origin mismatch. A known origin is selected completely in this
         session so retiring it cannot suppress an unselected sibling. This receipt covers SQLite only.
         """
         if not isinstance(session_id, str) or not session_id or not message_ids or any(
@@ -1685,8 +1692,12 @@ class SessionMessagesMixin:
             if len(rows) != len(selected):
                 raise ValueError("message_scope_changed")
             if retire_session_scope:
-                prefix = {row[0] for row in conn.execute(
-                    "SELECT id FROM messages WHERE session_id=? AND id<=?", (session_id,max(selected)))}
+                prefix = {
+                    row[0] for row in conn.execute(
+                        "SELECT id FROM messages WHERE session_id=? AND id<=?",
+                        (session_id, max(selected)),
+                    )
+                }
                 if prefix != set(selected):
                     raise ValueError("session_selection_incomplete")
             if expected_origin is not None:
@@ -1718,10 +1729,14 @@ class SessionMessagesMixin:
                 token_count=NULL WHERE id=? AND session_id=?""", updates,
             )
             if retire_session_scope:
-                changed = conn.execute("UPDATE sessions SET ended_at=?,end_reason='owner_erasure' "
-                    "WHERE id=? AND coalesce(end_reason,'')<>'owner_erasure'", (time.time(),session_id))
+                conn.execute("INSERT OR IGNORE INTO erased_message_origins(origin_key) VALUES(?)",
+                    (self._session_scope_key(session_id),))
+                changed = conn.execute(
+                    "UPDATE sessions SET ended_at=?,end_reason='owner_erasure' "
+                    "WHERE id=? AND ended_at IS NULL", (time.time(), session_id),
+                )
                 if changed.rowcount:
-                    self._bump_conversation_generation(conn,session_id,"session_reset")
+                    self._bump_conversation_generation(conn, session_id, "session_reset")
             return {"scope": "sqlite_message_payloads", "message_ids": selected, "contents_cleared": True}
 
         return self._execute_write(_do)
