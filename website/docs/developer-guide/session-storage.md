@@ -6,6 +6,34 @@ sessions. This replaces the earlier per-session JSONL file approach.
 
 Source files: `hermes_state.py` (facade) plus the `hermes_state_*.py` siblings (schema, fts, search, compression, portability, gateway, ...)
 
+## Host origins and explicit archive erasure
+
+New agent flushes add `display_metadata._hermes_origin` from the host's
+session ID, turn ID and platform input-message ID. Provider-supplied values
+for this reserved field cannot replace the host values. API message dictionaries
+and their role order are not rewritten. In-place compaction retains the source
+origins of its archived inputs in `_hermes_source_origins`.
+
+`SessionDB.erase_message_payloads(session_id, message_ids,
+expected_origin=...)` validates all selected rows before changing any payload.
+The caller must authorize the owner and approve the scope first. It clears text,
+API and reasoning sidecars, and tool arguments while keeping row IDs, roles,
+tool-call pairing and unrelated rows. FTS follows the same transaction.
+A known origin must include every associated row in the selected session;
+partial selection is rejected. Metadata-only origin marks prevent a later append
+or transcript replacement from restoring a retired payload. Old rows without
+origins require the caller's explicit `allow_legacy=True` selection.
+
+The SQLite receipt does not cover exported files. `erase_archive_files` in
+`hermes_archive_erasure.py` accepts explicit caller-owned JSON/JSONL paths.
+It uses origin metadata, validates all files first, and atomically replaces each
+changed file. Unselected JSONL lines retain their original bytes. Unattributed
+legacy payloads raise `archive_scope_required`; `whole_file_scope=True` is only
+for a separately approved complete-file selection. A filesystem failure leaves
+the caller responsible for reporting partial completion and collecting the
+remaining receipts. These APIs do not discover paths, grant access, choose
+retention policy, delete backups, or claim a multi-store operation complete.
+
 ## Hermes home and profile isolation
 
 `get_hermes_home()` is the authoritative filesystem resolver for state and

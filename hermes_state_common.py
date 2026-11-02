@@ -428,6 +428,10 @@ CREATE TABLE IF NOT EXISTS messages (
     display_order INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS erased_message_origins (
+    origin_key TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

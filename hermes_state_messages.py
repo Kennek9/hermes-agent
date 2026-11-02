@@ -18,7 +18,7 @@ from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
     _COMPRESSION_LOCK_ROW_SQL, _ENDED_ROW_SQL, _RESET_END_REASONS, _RESET_END_REASONS_SQL, _ended_by_compression,
-    _legacy_reset_child_sql, _placeholders, _sql_json_extract)
+    _id_chunks, _legacy_reset_child_sql, _placeholders, _sql_json_extract)
 
 logger = logging.getLogger("hermes_state")  # caplog tests pin the origin module's name
 
@@ -35,6 +35,8 @@ _INSERT_MESSAGE_SQL = """INSERT INTO messages (session_id, role, content, tool_c
 _MESSAGE_SCHEMA_KEYS = frozenset(
     re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0])
 ) | {"id", "compacted", "display_order"}
+_MESSAGE_INSERT_COLUMNS = tuple(re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0]))
+_ERASED_CONTENT = "[Message content cleared by owner]"
 _BUMP_GENERATION_SQL = """
             INSERT INTO conversation_generations (source, session_key, generation)
             VALUES (?, ?, 1)
@@ -121,6 +123,55 @@ def _stale_holder(row, now: float) -> bool:
 
 class SessionMessagesMixin:
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe."""
+
+    @staticmethod
+    def _origin_key(origin) -> str:
+        return json.dumps(origin, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _message_origins(metadata):
+        origins = list(metadata.get("_hermes_source_origins") or [])
+        if metadata.get("_hermes_origin") is not None:
+            origins.append(metadata["_hermes_origin"])
+        return list({SessionMessagesMixin._origin_key(origin): origin for origin in origins}.values())
+
+    @staticmethod
+    def _cleared_message_values(tool_calls, metadata):
+        calls = _parse_tool_calls(tool_calls)
+        if calls is not None and (
+            not isinstance(calls, list) or any(
+                not isinstance(call, dict) or not isinstance(call.get("function"), dict)
+                or not isinstance(call.get("id"), str)
+                or not isinstance(call["function"].get("name"), str) for call in calls
+            )
+        ):
+            raise ValueError("message_tool_calls_invalid")
+        cleared_calls = None if calls is None else json.dumps([
+            {"id": call["id"], "type": "function", "function": {
+                "name": call["function"]["name"], "arguments": "{}",
+            }} for call in calls
+        ])
+        kept = {"contents_cleared": True}
+        if metadata.get("_hermes_origin") is not None:
+            kept["_hermes_origin"] = metadata["_hermes_origin"]
+        if metadata.get("_hermes_source_origins"):
+            kept["_hermes_source_origins"] = metadata["_hermes_source_origins"]
+        return cleared_calls, json.dumps(kept)
+
+    def _insert_archive_row(self, conn, params):
+        """Retired host origins remain retired across append, replace and compaction copies."""
+        values = dict(zip(_MESSAGE_INSERT_COLUMNS, params))
+        metadata = self._decode_display_metadata(values["display_metadata"]) or {}
+        if any(conn.execute(
+            "SELECT 1 FROM erased_message_origins WHERE origin_key=?", (self._origin_key(origin),)
+        ).fetchone() for origin in self._message_origins(metadata)):
+            calls, kept = self._cleared_message_values(values["tool_calls"], metadata)
+            values.update(content=_ERASED_CONTENT, tool_calls=calls, display_metadata=kept, display_identity=None)
+            for key in ("api_content", "reasoning", "reasoning_content", "reasoning_details",
+                        "codex_reasoning_items", "codex_message_items", "token_count"):
+                values[key] = None
+            params = tuple(values[column] for column in _MESSAGE_INSERT_COLUMNS)
+        return conn.execute(_INSERT_MESSAGE_SQL, params)
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
         """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
@@ -320,7 +371,7 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            msg_id = self._insert_archive_row(conn, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
         # THE critical write (failure aborts the turn): long patience so a sibling legitimately
@@ -355,7 +406,7 @@ class SessionMessagesMixin:
             if existing is not None:
                 return existing[0]
             self._check_transcript_write_guards(conn, session_id, None, reject_active_turn_lease=True)
-            msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+            msg_id = self._insert_archive_row(conn, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, 0, unit=True)
             return msg_id
 
@@ -521,7 +572,7 @@ class SessionMessagesMixin:
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
-            cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
+            cur = self._insert_archive_row(conn, self._message_row_params(
                 session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=role == "assistant"))
             # Keep the caller's live row aligned with the durable identity. Rows created without an explicit
             # timestamp (notably mid-turn steers) may be carried through several compaction generations; if
@@ -764,6 +815,20 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+            # The host knows every archived input even when the generated summary paraphrases it.
+            source_origins = []
+            for row in conn.execute(
+                "SELECT display_metadata FROM messages WHERE session_id=? AND active=1"
+                + (" AND id<=?" if watermark is not None else ""),
+                (session_id, *((int(watermark),) if watermark is not None else ())),
+            ):
+                source_origins.extend(self._message_origins(self._decode_display_metadata(row[0]) or {}))
+            source_origins = list({self._origin_key(origin): origin for origin in source_origins}.values())
+            for message in compacted_messages:
+                if message.get("_compressed_summary") and source_origins:
+                    metadata = dict(self._decode_display_metadata(message.get("display_metadata")) or {})
+                    metadata["_hermes_source_origins"] = source_origins
+                    message["display_metadata"] = metadata
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
@@ -1549,6 +1614,76 @@ class SessionMessagesMixin:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute(_RESET_COUNTERS_SQL, (session_id,))
         self._execute_write(_do)
+
+    def erase_message_payloads(
+        self, session_id: str, message_ids: List[int], *,
+        expected_origin: Optional[Dict[str, Any]] = None, allow_legacy: bool = False,
+    ) -> Dict[str, Any]:
+        """Clear selected SQLite payloads while retaining message IDs and tool-call pairing.
+
+        The caller owns authorization and explicit scope approval. Legacy rows require a separate
+        opt-in; an origin mismatch always rejects. A known origin must be selected completely in this
+        session so retiring it cannot suppress an unselected sibling. This receipt covers SQLite only.
+        """
+        if not isinstance(session_id, str) or not session_id or not message_ids or any(
+            type(value) is not int or value < 0 for value in message_ids
+        ):
+            raise ValueError("invalid_message_selection")
+        if expected_origin is not None and (
+            not isinstance(expected_origin, dict)
+            or set(expected_origin) != {"session_id", "turn_id", "message_id"}
+            or not all(isinstance(expected_origin[key], str) and expected_origin[key]
+                       for key in ("session_id", "turn_id"))
+            or expected_origin["message_id"] is not None
+            and not isinstance(expected_origin["message_id"], str)
+        ):
+            raise ValueError("invalid_message_origin")
+        selected = list(dict.fromkeys(message_ids))
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn, session_id, None, reject_active_turn_lease=True,
+                reject_active_compression_lock=True, allow_closed_compression_parent=True,
+            )
+            rows = []
+            for chunk in _id_chunks(selected):
+                rows.extend(conn.execute(
+                    "SELECT id,tool_calls,display_metadata FROM messages WHERE session_id=? "
+                    f"AND id IN ({_placeholders(chunk)}) ORDER BY id", (session_id, *chunk),
+                ).fetchall())
+            if len(rows) != len(selected):
+                raise ValueError("message_scope_changed")
+            if expected_origin is not None:
+                siblings = {
+                    row["id"] for row in conn.execute(
+                        "SELECT id,display_metadata FROM messages WHERE session_id=?", (session_id,),
+                    ) if expected_origin in self._message_origins(self._decode_display_metadata(row["display_metadata"]) or {})
+                }
+                if not siblings.issubset(selected):
+                    raise ValueError("message_selection_incomplete")
+            updates = []
+            for row in rows:
+                metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+                origins = self._message_origins(metadata)
+                if not origins:
+                    if not allow_legacy:
+                        raise ValueError("message_origin_required")
+                elif expected_origin is None or expected_origin not in origins:
+                    raise ValueError("message_scope_changed")
+                cleared_calls, kept = self._cleared_message_values(row["tool_calls"], metadata)
+                updates.append((cleared_calls, kept, row["id"], session_id))
+            if expected_origin is not None:
+                conn.execute("INSERT OR IGNORE INTO erased_message_origins(origin_key) VALUES(?)",
+                             (self._origin_key(expected_origin),))
+            conn.executemany(
+                """UPDATE messages SET content='[Message content cleared by owner]',api_content=NULL,
+                reasoning=NULL,reasoning_content=NULL,reasoning_details=NULL,codex_reasoning_items=NULL,
+                codex_message_items=NULL,tool_calls=?,display_metadata=?,display_identity=NULL,
+                token_count=NULL WHERE id=? AND session_id=?""", updates,
+            )
+            return {"scope": "sqlite_message_payloads", "message_ids": selected, "contents_cleared": True}
+
+        return self._execute_write(_do)
 
     def purge_stale_tool_call_markers(self, *, dry_run: bool = False, backup: bool = True) -> Dict[str, Any]:
         """Permanently clear bare tool-call marker content ("[memory]") left by pre-fix sessions
