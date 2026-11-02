@@ -77,6 +77,8 @@ def archive_export_context(agent):
     state_path = Path(database.db_path) if database is not None else agent.logs_dir.parent / "state.db"
     metadata = {"_hermes_archive_profile": archive_profile_key(state_path)}
     session, turn = getattr(agent, "session_id", None), getattr(agent, "_current_turn_id", None)
+    if session:
+        metadata["_hermes_session_id"] = session
     if session and turn:
         metadata["_hermes_origin"] = {"session_id": session, "turn_id": turn,
             "message_id": getattr(agent, "_persist_user_message_platform_id", None)}

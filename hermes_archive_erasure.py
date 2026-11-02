@@ -23,7 +23,23 @@ def archive_profile_key(state_path: Path) -> str:
         str(state_path.parent.resolve()), str(state_path.resolve())]).encode()).hexdigest()
 
 
-def prepare_archive_rows(messages, state_path: Path):
+def _cleared_archive_value(value, metadata):
+    calls, kept = SessionMessagesMixin._cleared_message_values(value.get("tool_calls"), metadata)
+    cleared = {key: item for key, item in value.items() if key in _IDENTIFIERS}
+    cleared["display_metadata"] = json.loads(kept)
+    for key in ("_hermes_archive_profile", "_hermes_session_id"):
+        if metadata.get(key) is not None:
+            cleared["display_metadata"][key] = metadata[key]
+    if "content" in value:
+        cleared["content"] = _ERASED_CONTENT
+    if "value" in value:
+        cleared["value"] = _ERASED_CONTENT
+    if calls is not None:
+        cleared["tool_calls"] = json.loads(calls)
+    return cleared
+
+
+def prepare_archive_rows(messages, state_path: Path, *, session_id=None):
     """Apply known origin retirements before a fallback write, without mutating caller rows.
 
     A corrupt or unavailable current database cannot attest retirements. Preserve the fallback
@@ -33,13 +49,23 @@ def prepare_archive_rows(messages, state_path: Path):
         profile_key = archive_profile_key(state_path)
         with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             connection.execute("BEGIN")
+            scoped = bool(session_id and connection.execute(
+                "SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
+                (session_id,)).fetchone())
             prepared = []
             for message in messages:
                 if not isinstance(message, dict):
-                    prepared.append(message)
+                    prepared.append(_ERASED_CONTENT if scoped else message)
                     continue
                 metadata = SessionMessagesMixin._decode_display_metadata(
                     message.get("display_metadata")) or {}
+                host_session = message.get("session_id") or metadata.get("_hermes_session_id")
+                if (scoped or host_session and connection.execute(
+                        "SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
+                        (host_session,)).fetchone()) and metadata.get(
+                            "_hermes_archive_profile", profile_key) == profile_key:
+                    prepared.append(_cleared_archive_value(message, metadata))
+                    continue
                 retired = next((origin for origin in SessionMessagesMixin._message_origins(metadata)
                     if connection.execute("SELECT 1 FROM erased_message_origins WHERE origin_key=?",
                         (SessionMessagesMixin._origin_key(origin),)).fetchone()), None)
@@ -66,18 +92,7 @@ def _erase_tree(value, origin, profile_key=None, strict_profile=False):
             return value, 0, False
         if strict_profile and owner is None:
             return value, 0, True
-        calls, kept = SessionMessagesMixin._cleared_message_values(value.get("tool_calls"), metadata)
-        cleared = {key: item for key, item in value.items() if key in _IDENTIFIERS}
-        cleared["display_metadata"] = json.loads(kept)
-        if owner is not None:
-            cleared["display_metadata"]["_hermes_archive_profile"] = owner
-        if "content" in value:
-            cleared["content"] = _ERASED_CONTENT
-        if "value" in value:
-            cleared["value"] = _ERASED_CONTENT
-        if calls is not None:
-            cleared["tool_calls"] = json.loads(calls)
-        return cleared, 1, False
+        return _cleared_archive_value(value, metadata), 1, False
     children = {key: _erase_tree(item, origin, profile_key, strict_profile) for key, item in value.items()}
     return ({key: item[0] for key, item in children.items()},
             sum(item[1] for item in children.values()),

@@ -44,6 +44,16 @@ partial selection is rejected. Metadata-only origin marks prevent a later append
 or transcript replacement from restoring a retired payload. Old rows without
 origins require the caller's explicit `allow_legacy=True` selection.
 
+For an explicitly approved legacy source-session boundary, callers can also set
+`retire_session_scope=True`, with `allow_legacy=True` and no `expected_origin`.
+The selection must contain the complete message-ID prefix through its last row.
+Later rows stay intact. The transaction clears that prefix and ends the old
+session as `owner_erasure`; transcript writes, compaction and reopening then
+refuse that session. Normal gateway routing starts a fresh session for later
+input. Late recovery and export preparation neutralize copies from the retired
+session without rewriting caller messages. This option does not choose or
+authorize the caller's deletion scope, and it still does not cover existing files.
+
 The SQLite receipt does not cover exported files. `erase_archive_files` in
 `hermes_archive_erasure.py` accepts explicit caller-owned JSON/JSONL paths.
 It uses origin metadata, validates all files first, and atomically replaces each

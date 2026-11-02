@@ -484,6 +484,7 @@ class SessionSessionsMixin:
         The guard compares against the parent's started_at, not its current ended_at: a parent that was
         reopened and re-ended later still owns reset children from its earlier boundaries."""
         def _do(conn):
+            self._check_retired_session_scope(conn, session_id)
             conn.execute(
                 "UPDATE sessions AS child SET model_config = json_set("
                 "COALESCE(child.model_config, '{}'), '$._reset_from', child.parent_session_id) "

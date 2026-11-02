@@ -129,6 +129,12 @@ class SessionMessagesMixin:
         return json.dumps(origin, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
+    def _check_retired_session_scope(conn, session_id):
+        if conn.execute("SELECT 1 FROM sessions WHERE id=? AND end_reason='owner_erasure'",
+                        (session_id,)).fetchone():
+            raise ValueError("session_scope_retired")
+
+    @staticmethod
     def _message_origins(metadata):
         origins = list(metadata.get("_hermes_source_origins") or [])
         if metadata.get("_hermes_origin") is not None:
@@ -270,7 +276,7 @@ class SessionMessagesMixin:
     def _check_transcript_write_guards(self, conn, session_id: str, compression_lock_holder: Optional[str],
         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
-        allow_closed_compression_parent: bool = False) -> None:
+        allow_closed_compression_parent: bool = False, allow_retired_session_scope: bool = False) -> None:
         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
         NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
         commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
@@ -284,6 +290,8 @@ class SessionMessagesMixin:
         """
         from hermes_state import SessionCompressionInProgressError
         from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+        if not allow_retired_session_scope:
+            self._check_retired_session_scope(conn, session_id)
         # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
         # COMPRESSIONS colliding, not to fence ordinary transcript writes. Concurrent appends during a
         # compression are safe by construction: archive_and_compact() commits against a watermark captured
@@ -648,6 +656,8 @@ class SessionMessagesMixin:
                     conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
             elif _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()):
                 raise CompressionSessionClosedError(session_id)
+            else:
+                self._check_retired_session_scope(conn, session_id)
             kept = kept_tool_calls = 0
             if archive_dropped:
                 # Only the first len(messages)+1 live rows matter: the prefix to match plus the row whose
@@ -826,6 +836,7 @@ class SessionMessagesMixin:
         """
         from hermes_state import SessionCompressionInProgressError
         def _do(conn):
+            self._check_retired_session_scope(conn, session_id)
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
@@ -1634,6 +1645,7 @@ class SessionMessagesMixin:
     def erase_message_payloads(
         self, session_id: str, message_ids: List[int], *,
         expected_origin: Optional[Dict[str, Any]] = None, allow_legacy: bool = False,
+        retire_session_scope: bool = False,
     ) -> Dict[str, Any]:
         """Clear selected SQLite payloads while retaining message IDs and tool-call pairing.
 
@@ -1654,12 +1666,15 @@ class SessionMessagesMixin:
             and not isinstance(expected_origin["message_id"], str)
         ):
             raise ValueError("invalid_message_origin")
+        if retire_session_scope and (not allow_legacy or expected_origin is not None):
+            raise ValueError("invalid_session_scope")
         selected = list(dict.fromkeys(message_ids))
 
         def _do(conn):
             self._check_transcript_write_guards(
                 conn, session_id, None, reject_active_turn_lease=True,
                 reject_active_compression_lock=True, allow_closed_compression_parent=True,
+                allow_retired_session_scope=retire_session_scope,
             )
             rows = []
             for chunk in _id_chunks(selected):
@@ -1669,6 +1684,11 @@ class SessionMessagesMixin:
                 ).fetchall())
             if len(rows) != len(selected):
                 raise ValueError("message_scope_changed")
+            if retire_session_scope:
+                prefix = {row[0] for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id=? AND id<=?", (session_id,max(selected)))}
+                if prefix != set(selected):
+                    raise ValueError("session_selection_incomplete")
             if expected_origin is not None:
                 siblings = {
                     row["id"] for row in conn.execute(
@@ -1684,7 +1704,7 @@ class SessionMessagesMixin:
                 if not origins:
                     if not allow_legacy:
                         raise ValueError("message_origin_required")
-                elif expected_origin is None or expected_origin not in origins:
+                elif not retire_session_scope and (expected_origin is None or expected_origin not in origins):
                     raise ValueError("message_scope_changed")
                 cleared_calls, kept = self._cleared_message_values(row["tool_calls"], metadata)
                 updates.append((cleared_calls, kept, row["id"], session_id))
@@ -1697,6 +1717,11 @@ class SessionMessagesMixin:
                 codex_message_items=NULL,tool_calls=?,display_metadata=?,display_identity=NULL,
                 token_count=NULL WHERE id=? AND session_id=?""", updates,
             )
+            if retire_session_scope:
+                changed = conn.execute("UPDATE sessions SET ended_at=?,end_reason='owner_erasure' "
+                    "WHERE id=? AND coalesce(end_reason,'')<>'owner_erasure'", (time.time(),session_id))
+                if changed.rowcount:
+                    self._bump_conversation_generation(conn,session_id,"session_reset")
             return {"scope": "sqlite_message_payloads", "message_ids": selected, "contents_cleared": True}
 
         return self._execute_write(_do)
