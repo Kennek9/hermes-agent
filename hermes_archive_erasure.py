@@ -35,6 +35,9 @@ def prepare_archive_rows(messages, state_path: Path):
             connection.execute("BEGIN")
             prepared = []
             for message in messages:
+                if not isinstance(message, dict):
+                    prepared.append(message)
+                    continue
                 metadata = SessionMessagesMixin._decode_display_metadata(
                     message.get("display_metadata")) or {}
                 retired = next((origin for origin in SessionMessagesMixin._message_origins(metadata)
