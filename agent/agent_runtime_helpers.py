@@ -1409,8 +1409,13 @@ def dump_api_request_debug(
                 "body": body,
             },
         }
+        from agent.session_persistence import archive_export_context
+        from hermes_archive_erasure import prepare_archive_rows
+        metadata, state_path = archive_export_context(agent)
+        dump_payload["display_metadata"] = metadata
         if error is not None:
             dump_payload["error"] = _api_error_debug_info(error)
+        dump_payload = prepare_archive_rows([dump_payload], state_path)[0]
         # Sanitize the session ID (may come from an untrusted X-Hermes-Session-Id header) so a
         # "../"-shaped ID cannot write outside logs_dir.
         from agent.session_persistence import _safe_session_filename_component

@@ -5,7 +5,9 @@ import hashlib
 
 import logging
 import re
+import sqlite3
 from contextlib import nullcontext
+from pathlib import Path
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,6 +66,26 @@ def _safe_session_filename_component(session_id: str) -> str:
     if raw and sanitized == raw:
         return sanitized
     return f"{sanitized}_{hashlib.sha256(raw.encode('utf-8', errors='surrogatepass')).hexdigest()[:12]}"
+
+
+def archive_export_context(agent):
+    """Attest export dependencies from host state and actual stored origins, never API fields."""
+    from hermes_state_errors import StateDbReplacedError
+
+    database = getattr(agent, "_session_db", None)
+    state_path = Path(database.db_path) if database is not None else agent.logs_dir.parent / "state.db"
+    metadata = {}
+    session, turn = getattr(agent, "session_id", None), getattr(agent, "_current_turn_id", None)
+    if session and turn:
+        metadata["_hermes_origin"] = {"session_id": session, "turn_id": turn,
+            "message_id": getattr(agent, "_persist_user_message_platform_id", None)}
+    if database is not None:
+        try:
+            metadata["_hermes_source_origins"] = database.get_archive_origins(session)
+        except (OSError, sqlite3.Error, StateDbReplacedError):
+            # Preserve recovery exports; unavailable provenance cannot prove erasure completeness.
+            pass
+    return metadata, state_path
 
 
 def _override_replaces_content(msg: Dict, content: Any, override: Any) -> bool:
@@ -454,7 +476,9 @@ class SessionPersistenceMixin:
         if not self.save_trajectories:
             return
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
-        _save_trajectory_to_file(trajectory, self.model, completed)
+        metadata, state_path = archive_export_context(self)
+        _save_trajectory_to_file(trajectory, self.model, completed,
+                                 display_metadata=metadata, state_path=state_path)
 
     _extract_api_error_context = _forward_static("agent.agent_runtime_helpers", "extract_api_error_context")
     _dump_api_request_debug = _forward("agent.agent_runtime_helpers", "dump_api_request_debug")

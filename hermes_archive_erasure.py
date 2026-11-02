@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 import tempfile
 
@@ -12,6 +14,28 @@ from hermes_state_messages import SessionMessagesMixin, _ERASED_CONTENT
 _IDENTIFIERS = {"id", "session_id", "role", "from", "timestamp", "tool_call_id", "tool_name",
                 "platform_message_id", "active", "compacted"}
 _PAYLOAD_KEYS = {"content", "value", "api_content", "reasoning", "reasoning_content", "tool_calls"}
+
+
+def prepare_archive_rows(messages, state_path: Path):
+    """Apply known origin retirements before a fallback write, without mutating caller rows.
+
+    A corrupt or unavailable current database cannot attest retirements. Preserve the fallback
+    and its provenance for recovery; that condition is never a successful erasure receipt.
+    """
+    try:
+        with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.execute("BEGIN")
+            prepared = []
+            for message in messages:
+                metadata = SessionMessagesMixin._decode_display_metadata(
+                    message.get("display_metadata")) or {}
+                retired = next((origin for origin in SessionMessagesMixin._message_origins(metadata)
+                    if connection.execute("SELECT 1 FROM erased_message_origins WHERE origin_key=?",
+                        (SessionMessagesMixin._origin_key(origin),)).fetchone()), None)
+                prepared.append(_erase_tree(message, retired)[0] if retired else message)
+            return prepared
+    except (OSError, sqlite3.Error):
+        return messages
 
 
 def _erase_tree(value, origin):
