@@ -189,6 +189,8 @@ def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
 
 def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any]:
     """Build the session-db row for ``msg``, applying the persist override to THIS row only."""
+    from hermes_state_messages import SessionMessagesMixin
+
     role = msg.get("role", "unknown")
     content = msg.get("content")
     # api_content sidecar: exact bytes sent to the API when they differ from clean content (replay parity).
@@ -207,6 +209,17 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content
+    # Archive provenance is host state, never a provider-supplied display field.
+    metadata = dict(SessionMessagesMixin._decode_display_metadata(msg.get("display_metadata")) or {})
+    metadata.pop("_hermes_origin", None)
+    session_id = getattr(agent, "session_id", None)
+    turn_id = getattr(agent, "_current_turn_id", None)
+    if session_id and turn_id:
+        metadata["_hermes_origin"] = {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "message_id": getattr(agent, "_persist_user_message_platform_id", None),
+        }
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
@@ -215,7 +228,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": metadata or None,
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
     }
     if isinstance(msg.get("_row_id"), int):
