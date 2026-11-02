@@ -31,6 +31,9 @@ def test_unmapped_file_requires_explicit_scope_and_no_earlier_file_is_changed(tm
     legacy.write_text(json.dumps({"conversations": [{"from": "human", "value": "Unmapped value"}]}))
     before = mapped.read_bytes(), legacy.read_bytes()
     with pytest.raises(ValueError, match="archive_scope_required"):
+        erase_archive_files([mapped], origin, expected_profile_key="explicit-owner-scope")
+    assert (mapped.read_bytes(), legacy.read_bytes()) == before
+    with pytest.raises(ValueError, match="archive_scope_required"):
         erase_archive_files([mapped, legacy], origin)
     assert (mapped.read_bytes(), legacy.read_bytes()) == before
     erase_archive_files([legacy], origin, whole_file_scope=True)
@@ -56,7 +59,7 @@ def test_late_diversion_keeps_retired_origins_cleared_and_profiles_independent(t
     for index, home in enumerate(homes):
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
-        with SessionDB() as db:
+        with SessionDB(home / "state.db") as db:
             db.create_session("shared-id", "cli")
             message = db.append_message("shared-id", "assistant", "OLD_FILE_COPY_718",
                 display_metadata={"_hermes_origin": origin})

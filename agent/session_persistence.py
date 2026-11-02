@@ -71,10 +71,11 @@ def _safe_session_filename_component(session_id: str) -> str:
 def archive_export_context(agent):
     """Attest export dependencies from host state and actual stored origins, never API fields."""
     from hermes_state_errors import StateDbReplacedError
+    from hermes_archive_erasure import archive_profile_key
 
     database = getattr(agent, "_session_db", None)
     state_path = Path(database.db_path) if database is not None else agent.logs_dir.parent / "state.db"
-    metadata = {}
+    metadata = {"_hermes_archive_profile": archive_profile_key(state_path)}
     session, turn = getattr(agent, "session_id", None), getattr(agent, "_current_turn_id", None)
     if session and turn:
         metadata["_hermes_origin"] = {"session_id": session, "turn_id": turn,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,12 @@ _IDENTIFIERS = {"id", "session_id", "role", "from", "timestamp", "tool_call_id",
 _PAYLOAD_KEYS = {"content", "value", "api_content", "reasoning", "reasoning_content", "tool_calls"}
 
 
+def archive_profile_key(state_path: Path) -> str:
+    """A file's namespace is the owning database path, without persisting that path."""
+    return hashlib.sha256(json.dumps([
+        str(state_path.parent.resolve()), str(state_path.resolve())]).encode()).hexdigest()
+
+
 def prepare_archive_rows(messages, state_path: Path):
     """Apply known origin retirements before a fallback write, without mutating caller rows.
 
@@ -23,6 +30,7 @@ def prepare_archive_rows(messages, state_path: Path):
     and its provenance for recovery; that condition is never a successful erasure receipt.
     """
     try:
+        profile_key = archive_profile_key(state_path)
         with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             connection.execute("BEGIN")
             prepared = []
@@ -32,15 +40,16 @@ def prepare_archive_rows(messages, state_path: Path):
                 retired = next((origin for origin in SessionMessagesMixin._message_origins(metadata)
                     if connection.execute("SELECT 1 FROM erased_message_origins WHERE origin_key=?",
                         (SessionMessagesMixin._origin_key(origin),)).fetchone()), None)
-                prepared.append(_erase_tree(message, retired)[0] if retired else message)
+                prepared.append(_erase_tree(message, retired, profile_key)[0]
+                                if retired else message)
             return prepared
     except (OSError, sqlite3.Error):
         return messages
 
 
-def _erase_tree(value, origin):
+def _erase_tree(value, origin, profile_key=None, strict_profile=False):
     if isinstance(value, list):
-        children = [_erase_tree(item, origin) for item in value]
+        children = [_erase_tree(item, origin, profile_key, strict_profile) for item in value]
         return [item[0] for item in children], sum(item[1] for item in children), any(item[2] for item in children)
     if not isinstance(value, dict):
         return value, 0, False
@@ -49,9 +58,16 @@ def _erase_tree(value, origin):
     if origins:
         if origin not in origins:
             return value, 0, False
+        owner = metadata.get("_hermes_archive_profile")
+        if owner is not None and profile_key is not None and owner != profile_key:
+            return value, 0, False
+        if strict_profile and owner is None:
+            return value, 0, True
         calls, kept = SessionMessagesMixin._cleared_message_values(value.get("tool_calls"), metadata)
         cleared = {key: item for key, item in value.items() if key in _IDENTIFIERS}
         cleared["display_metadata"] = json.loads(kept)
+        if owner is not None:
+            cleared["display_metadata"]["_hermes_archive_profile"] = owner
         if "content" in value:
             cleared["content"] = _ERASED_CONTENT
         if "value" in value:
@@ -59,18 +75,21 @@ def _erase_tree(value, origin):
         if calls is not None:
             cleared["tool_calls"] = json.loads(calls)
         return cleared, 1, False
-    children = {key: _erase_tree(item, origin) for key, item in value.items()}
+    children = {key: _erase_tree(item, origin, profile_key, strict_profile) for key, item in value.items()}
     return ({key: item[0] for key, item in children.items()},
             sum(item[1] for item in children.values()),
             bool(_PAYLOAD_KEYS & value.keys()) or any(item[2] for item in children.values()))
 
 
-def erase_archive_files(paths: list[Path], expected_origin: dict, *, whole_file_scope: bool = False) -> dict:
+def erase_archive_files(paths: list[Path], expected_origin: dict, *, whole_file_scope: bool = False,
+                        expected_profile_key: str | None = None) -> dict:
     """Erase only explicit caller-owned files; legacy payloads require whole-file confirmation.
 
     Validate every file before writing any. Each replacement is atomic. A filesystem failure raises,
     so the caller must keep a multi-store operation pending rather than claiming complete cleanup.
     """
+    from hermes_constants import get_hermes_home
+    profile_key = expected_profile_key or archive_profile_key(get_hermes_home() / "state.db")
     prepared = []
     for path in dict.fromkeys(Path(value) for value in paths):
         if path.is_symlink() or not path.is_file():
@@ -84,7 +103,8 @@ def erase_archive_files(paths: list[Path], expected_origin: dict, *, whole_file_
             if not line.strip():
                 transformed.append(line)
                 continue
-            value, count, unmapped = _erase_tree(json.loads(line), expected_origin)
+            value, count, unmapped = _erase_tree(json.loads(line), expected_origin,
+                                                profile_key, expected_profile_key is not None)
             changed += count
             legacy = legacy or unmapped
             transformed.append((json.dumps(value, ensure_ascii=False) + "\n").encode() if count else line)
