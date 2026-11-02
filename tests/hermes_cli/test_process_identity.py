@@ -154,8 +154,14 @@ def test_register_child_can_omit_argv_without_losing_process_identity(tmp_path, 
     ledger = tmp_path / "spawn-ledger.json"
     monkeypatch.setattr(pi, "_ledger_path", lambda: ledger)
     argument = "personal-launch-value-68c112"
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", argument])
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.buffer.read(1)", argument],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
     try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        assert argument in psutil.Process(child.pid).cmdline()
         options = {"record_argv": False} if private else {}
         assert pi.register_child(child.pid, "mcp-helper", **options)
         entry = next(item for item in json.loads(ledger.read_text()) if item["pid"] == child.pid)
@@ -169,6 +175,10 @@ def test_register_child_can_omit_argv_without_losing_process_identity(tmp_path, 
     finally:
         child.terminate()
         child.wait(timeout=5)
+        if child.stdin is not None:
+            child.stdin.close()
+        if child.stdout is not None:
+            child.stdout.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
