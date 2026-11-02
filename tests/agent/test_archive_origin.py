@@ -70,7 +70,7 @@ def test_real_debug_and_trajectory_exports_can_erase_their_recorded_input_origin
     messages = [{"role": "user", "content": "EXPORT_INPUT_719"},
                 {"role": "assistant", "content": "EXPORT_INPUT_719 answer"}]
     original = copy.deepcopy(messages)
-    with SessionDB() as db:
+    with SessionDB(tmp_path / "home" / "state.db") as db:
         agent._session_db = db
         db.create_session(agent.session_id, "cli")
         db.append_messages_batch(agent.session_id,
@@ -93,3 +93,40 @@ def test_real_debug_and_trajectory_exports_can_erase_their_recorded_input_origin
         agent._save_trajectory(messages, "Current question", completed=True)
         assert "EXPORT_INPUT_719" not in later.read_text() + trajectory.read_text()
         assert messages == original
+
+
+def test_shared_trajectory_erasure_preserves_another_profile_with_the_same_session_ids(tmp_path, monkeypatch):
+    from hermes_archive_erasure import erase_archive_files
+    from run_agent import AIAgent
+
+    monkeypatch.chdir(tmp_path)
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    origin = {"session_id": "same-session", "turn_id": "same-turn", "message_id": "same-input"}
+    for index in (0, 1, 0):
+        home = homes[index]
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = object.__new__(AIAgent)
+        agent.session_id = origin['session_id']
+        agent._current_turn_id = origin['turn_id']
+        agent._persist_user_message_platform_id = origin['message_id']
+        agent.tools = []
+        agent.model = "synthetic-model"
+        agent.save_trajectories = True
+        agent.logs_dir = home / "sessions"
+        body = f"PROFILE_COPY_720_{index}"
+        messages = [{"role": "user", "content": body}]
+        with SessionDB(home / "state.db") as db:
+            agent._session_db = db
+            if not db.get_session(agent.session_id):
+                db.create_session(agent.session_id, "cli")
+                db.append_messages_batch(agent.session_id, [_db_flush_row(agent, messages[0], True)])
+            agent._save_trajectory(messages, body, completed=True)
+    shared = tmp_path / "trajectory_samples.jsonl"
+    assert "PROFILE_COPY_720_0" in shared.read_text() and "PROFILE_COPY_720_1" in shared.read_text()
+    erase_archive_files([shared], origin)
+    assert "PROFILE_COPY_720_0" not in shared.read_text()
+    assert "PROFILE_COPY_720_1" in shared.read_text()
+    before = shared.read_bytes()
+    erase_archive_files([shared], origin)
+    assert shared.read_bytes() == before

@@ -23,6 +23,14 @@ If the current database cannot attest provenance, recovery exports are preserved
 that condition is not an erasure receipt, and older unbound exports still require
 an explicit caller-approved scope.
 
+Exported file envelopes also carry a profile key derived from the owning database
+path, without storing the path. Shared trajectory files can therefore contain
+different profiles with identical session/turn/input IDs. File erasure preserves
+envelopes from another profile. Callers can pass `expected_profile_key` for strict
+profile attribution. With that explicit key, a matching legacy envelope without
+profile attribution requires a separately approved scope. Cleared envelopes retain
+their profile key for retries.
+
 `SessionDB.erase_message_payloads(session_id, message_ids,
 expected_origin=...)` validates all selected rows before changing any payload.
 The caller must authorize the owner and approve the scope first. It clears text,
