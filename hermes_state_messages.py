@@ -135,6 +135,22 @@ class SessionMessagesMixin:
             origins.append(metadata["_hermes_origin"])
         return list({SessionMessagesMixin._origin_key(origin): origin for origin in origins}.values())
 
+    def get_archive_origins(self, session_id: str):
+        """Read reserved origin coordinates only, without allocating transcript or display prose."""
+        metadata = "CASE WHEN json_valid(display_metadata) THEN display_metadata ELSE '{}' END"
+        metadata = (f"CASE WHEN json_type({metadata})='text' "
+                    f"AND json_valid(json_extract({metadata},'$')) "
+                    f"THEN json_extract({metadata},'$') ELSE {metadata} END")
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT json_object('_hermes_origin',json_extract(" + metadata + ", '$._hermes_origin'),"
+                "'_hermes_source_origins',json_extract(" + metadata + ", '$._hermes_source_origins')) "
+                "AS origins FROM messages WHERE session_id=? AND active=1 ORDER BY id",
+                (session_id,)).fetchall()
+        origins = [origin for row in rows
+                   for origin in self._message_origins(self._decode_display_metadata(row['origins']) or {})]
+        return list({self._origin_key(origin): origin for origin in origins}.values())
+
     @staticmethod
     def _cleared_message_values(tool_calls, metadata):
         calls = _parse_tool_calls(tool_calls)

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,17 @@ def _lock_append_handle(f, acquire: bool) -> None:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX if acquire else fcntl.LOCK_UN)
 
 
-def save_trajectory(trajectory: List[Dict[str, Any]], model: str, completed: bool, filename: str = None):
+def save_trajectory(trajectory: List[Dict[str, Any]], model: str, completed: bool, filename: str = None,
+                    *, display_metadata: dict = None, state_path: Path = None):
     """Append a ShareGPT-format entry to a JSONL file (default trajectory_samples.jsonl / failed_trajectories.jsonl by ``completed``)."""
     if filename is None:
         filename = "trajectory_samples.jsonl" if completed else "failed_trajectories.jsonl"
     entry = {"conversations": trajectory, "timestamp": datetime.now().isoformat(), "model": model, "completed": completed}
+    if display_metadata:
+        entry["display_metadata"] = display_metadata
+        if state_path is not None:
+            from hermes_archive_erasure import prepare_archive_rows
+            entry = prepare_archive_rows([entry], state_path)[0]
     try:
         line = json.dumps(entry, ensure_ascii=False) + "\n"  # serialize before taking the lock
         with open(filename, "a", encoding="utf-8") as f:

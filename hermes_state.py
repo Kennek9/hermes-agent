@@ -427,11 +427,13 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
     sessions_dir = get_hermes_home() / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     path = sessions_dir / f"{sid}.jsonl"
+    from hermes_archive_erasure import prepare_archive_rows
+    records = [msg if isinstance(msg, dict) else {"content": str(msg)}
+               for msg in messages if msg is not None]
+    records = prepare_archive_rows(records, get_hermes_home() / "state.db")
     with path.open("a", encoding="utf-8") as handle:
-        for msg in messages:
-            if msg is not None:
-                record = msg if isinstance(msg, dict) else {"content": str(msg)}
-                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
     return path
 
 

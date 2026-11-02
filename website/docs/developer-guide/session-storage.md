@@ -14,6 +14,15 @@ for this reserved field cannot replace the host values. API message dictionaries
 and their role order are not rewritten. In-place compaction retains the source
 origins of its archived inputs in `_hermes_source_origins`.
 
+Agent request-debug dumps and trajectory entries carry host origin metadata and
+the origins found in their current stored transcript. Export preparation uses
+the owning SessionDB path, and checks its retired origins before writing a late
+copy. JSONL fallback writes apply the same check against the current profile's
+database. The live API input and caller message dictionaries stay unchanged.
+If the current database cannot attest provenance, recovery exports are preserved;
+that condition is not an erasure receipt, and older unbound exports still require
+an explicit caller-approved scope.
+
 `SessionDB.erase_message_payloads(session_id, message_ids,
 expected_origin=...)` validates all selected rows before changing any payload.
 The caller must authorize the owner and approve the scope first. It clears text,

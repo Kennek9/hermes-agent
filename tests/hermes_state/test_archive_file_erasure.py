@@ -46,3 +46,32 @@ def test_explicit_file_scope_does_not_expand_to_another_file(tmp_path):
     before = other.read_bytes()
     erase_archive_files([selected], origin, whole_file_scope=True)
     assert other.read_bytes() == before
+
+
+def test_late_diversion_keeps_retired_origins_cleared_and_profiles_independent(tmp_path, monkeypatch):
+    from hermes_state import SessionDB, divert_session_transcript_jsonl
+
+    origin = {"session_id": "shared-id", "turn_id": "turn-one", "message_id": "input-one"}
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for index, home in enumerate(homes):
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with SessionDB() as db:
+            db.create_session("shared-id", "cli")
+            message = db.append_message("shared-id", "assistant", "OLD_FILE_COPY_718",
+                display_metadata={"_hermes_origin": origin})
+            if index == 0:
+                db.erase_message_payloads("shared-id", [message], expected_origin=origin)
+    for home in (homes[0], homes[1], homes[0]):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        rows = [{"role": "assistant", "content": "OLD_FILE_COPY_718",
+                 "api_content": "OLD_FILE_COPY_718 wire", "reasoning_content": "OLD_FILE_COPY_718 reason",
+                 "display_metadata": {"_hermes_origin": origin}},
+                {"role": "user", "content": "Keep the later input",
+                 "display_metadata": {"_hermes_origin": {**origin, "turn_id": "turn-two"}}}]
+        original = json.dumps(rows, sort_keys=True)
+        path = divert_session_transcript_jsonl("shared-id", rows)
+        archived = path.read_text()
+        assert ("OLD_FILE_COPY_718" in archived) is (home == homes[1])
+        assert "Keep the later input" in archived
+        assert json.dumps(rows, sort_keys=True) == original
