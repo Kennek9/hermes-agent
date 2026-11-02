@@ -124,7 +124,7 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
     try:
         flush_dir = _get_flush_dir()
         from hermes_archive_erasure import prepare_archive_rows
-        message = prepare_archive_rows([message], flush_dir.parent / "state.db")[0]
+        message = prepare_archive_rows([message], flush_dir.parent / "state.db", session_id=session_id)[0]
         return _write_payload(flush_dir, {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
             "seq": next(_TRANSCRIPT_SPOOL_SEQ),
@@ -317,7 +317,7 @@ def flush_agent_history_to_file(session_id: Optional[str], history: list) -> Non
             except Exception:
                 continue
         from hermes_archive_erasure import prepare_archive_rows
-        snapshot = prepare_archive_rows(snapshot, flush_dir.parent / "state.db")
+        snapshot = prepare_archive_rows(snapshot, flush_dir.parent / "state.db", session_id=session_id)
         _write_payload(flush_dir, {
             "reason": "shutdown-with-unpersisted-agent-history", "issue": "#72680",
             "session_id": session_id, "count": len(snapshot), "messages": snapshot,

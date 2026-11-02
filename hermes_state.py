@@ -430,7 +430,7 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
     from hermes_archive_erasure import prepare_archive_rows
     records = [msg if isinstance(msg, dict) else {"content": str(msg)}
                for msg in messages if msg is not None]
-    records = prepare_archive_rows(records, get_hermes_home() / "state.db")
+    records = prepare_archive_rows(records, get_hermes_home() / "state.db", session_id=sid)
     with path.open("a", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
