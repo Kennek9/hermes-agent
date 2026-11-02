@@ -133,12 +133,15 @@ class SessionMessagesMixin:
         return SessionMessagesMixin._origin_key({"scope": "session", "session_id": session_id})
 
     @staticmethod
-    def _check_retired_session_scope(conn, session_id):
-        retired = conn.execute(
+    def _session_scope_retired(conn, session_id):
+        return conn.execute(
             "SELECT 1 FROM erased_message_origins WHERE origin_key=?",
             (SessionMessagesMixin._session_scope_key(session_id),),
-        ).fetchone()
-        if retired:
+        ).fetchone() is not None
+
+    @staticmethod
+    def _check_retired_session_scope(conn, session_id):
+        if SessionMessagesMixin._session_scope_retired(conn, session_id):
             raise ValueError("session_scope_retired")
 
     @staticmethod

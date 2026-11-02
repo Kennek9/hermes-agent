@@ -50,7 +50,8 @@ The selection must contain the complete message-ID prefix through its last row.
 Later rows stay intact. The transaction clears that prefix and ends the old
 session as `owner_erasure`; an already-ended session keeps its original reason.
 A metadata-only scope mark prevents transcript writes, compaction and reopening
-of that session. Normal gateway routing starts a fresh session for later
+of that session, and import skips its retired ID even if the session row was removed.
+Normal gateway routing starts a fresh session for later
 input. Late recovery and export preparation neutralize copies from the retired
 session without rewriting caller messages. This option does not choose or
 authorize the caller's deletion scope, and it still does not cover existing files.

@@ -51,6 +51,15 @@ def test_selected_legacy_payload_cannot_return_from_cached_transcript(tmp_path):
         assert db.get_session("already-compressed")["end_reason"] == "compression"
         with pytest.raises(ValueError, match="session_scope_retired"):
             db.append_message("already-compressed", "assistant", "Refuse a stale compressed writer")
+        db.create_session("retired-import", "cli")
+        imported = db.append_message("retired-import", "user", "LEGACY_IMPORT_724")
+        backup = db.export_session("retired-import")
+        db.erase_message_payloads("retired-import", [imported], allow_legacy=True,
+            retire_session_scope=True)
+        assert db.delete_session("retired-import")
+        recovered = db.import_sessions([backup])
+        assert recovered["imported"] == 0
+        assert recovered["skipped_ids"] == ["retired-import"]
 
 
 def test_retired_legacy_session_routes_new_input_to_fresh_history_and_neutralizes_late_files(

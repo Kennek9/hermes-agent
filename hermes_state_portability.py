@@ -603,7 +603,8 @@ class SessionPortabilityMixin:
             for item in normalized:
                 raw = item["session"]
                 session_id = str(raw.get("id") or "").strip()
-                if conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone():
+                if (conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)).fetchone()
+                        or self._session_scope_retired(conn, session_id)):
                     skipped_ids.append(session_id)
                     continue
                 self._import_session_row(conn, raw, item["messages"], session_id)
