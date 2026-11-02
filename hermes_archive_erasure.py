@@ -50,6 +50,9 @@ def prepare_archive_rows(messages, state_path: Path, *, session_id=None):
         with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
             connection.execute("BEGIN")
             scoped = bool(session_id and SessionMessagesMixin._session_scope_retired(connection, session_id))
+            through_id = SessionMessagesMixin._session_scope_through_id(connection, session_id) if scoped else None
+            if scoped and through_id is None:
+                raise ValueError("session_scope_unavailable")
             prepared = []
             for message in messages:
                 if not isinstance(message, dict):
@@ -61,8 +64,14 @@ def prepare_archive_rows(messages, state_path: Path, *, session_id=None):
                 if (scoped or host_session and SessionMessagesMixin._session_scope_retired(
                         connection, host_session)) and metadata.get(
                             "_hermes_archive_profile", profile_key) == profile_key:
-                    prepared.append(_cleared_archive_value(message, metadata))
-                    continue
+                    bound = through_id if scoped else SessionMessagesMixin._session_scope_through_id(
+                        connection, host_session)
+                    if bound is None:
+                        raise ValueError("session_scope_unavailable")
+                    row_id = message.get("_row_id", message.get("id"))
+                    if type(row_id) is not int or row_id <= bound:
+                        prepared.append(_cleared_archive_value(message, metadata))
+                        continue
                 retired = next((origin for origin in SessionMessagesMixin._message_origins(metadata)
                     if connection.execute("SELECT 1 FROM erased_message_origins WHERE origin_key=?",
                         (SessionMessagesMixin._origin_key(origin),)).fetchone()), None)

@@ -43,6 +43,9 @@ def test_selected_legacy_payload_cannot_return_from_cached_transcript(tmp_path):
         assert "LEGACY_REPLAY_722" not in json.dumps(db.get_messages("legacy-retired"))
         assert next(row for row in before if row['id']==later)['content']=='Keep the later confirmation'
         assert db.get_messages("unselected-session")[0]['content']=='Keep the other session'
+        db.erase_message_payloads("legacy-retired", [later], expected_origin={
+            "session_id":"legacy-retired","turn_id":"later-turn","message_id":"later-input"})
+        assert "Keep the later confirmation" not in json.dumps(db.get_messages("legacy-retired"))
         db.create_session("already-compressed", "cli")
         old = db.append_message("already-compressed", "user", "Old compressed source")
         db.end_session("already-compressed", "compression")
@@ -83,6 +86,8 @@ def test_retired_legacy_session_routes_new_input_to_fresh_history_and_neutralize
         assert db.get_session(first.session_id) is not None
         identity = db.append_message(first.session_id, "user", "LEGACY_RECOVERY_723")
         cached = db.get_messages(first.session_id)
+        db.append_message(first.session_id, "user", "Keep the post-preview input")
+        later = db.get_messages(first.session_id)[-1]
         db.erase_message_payloads(first.session_id, [identity], allow_legacy=True,
             retire_session_scope=True)
     flush_agent_history_to_file(first.session_id, cached)
@@ -91,6 +96,19 @@ def test_retired_legacy_session_routes_new_input_to_fresh_history_and_neutralize
     assert "LEGACY_RECOVERY_723" not in diverted.read_text()
     for path in (home / "pending_messages").glob("*.json"):
         assert "LEGACY_RECOVERY_723" not in path.read_text()
+    preserved = spool_dropped_transcript_message(first.session_id, later)
+    assert preserved is not None
+    assert "Keep the post-preview input" in preserved.read_text()
+    foreign = tmp_path / "other-home"
+    monkeypatch.setenv("HERMES_HOME", str(foreign))
+    with SessionDB(foreign / "state.db") as db:
+        db.create_session(first.session_id, "cli")
+        db.append_message(first.session_id, "user", "Keep the other profile input")
+        foreign_message = db.get_messages(first.session_id)[0]
+        untouched = spool_dropped_transcript_message(first.session_id, foreign_message)
+        assert untouched is not None
+        assert "Keep the other profile input" in untouched.read_text()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     new = store.get_or_create_session(source)
     assert new.session_id != first.session_id
     store.close_all_db_handles()
@@ -100,6 +118,7 @@ def test_retired_legacy_session_routes_new_input_to_fresh_history_and_neutralize
             db.append_messages_batch(first.session_id, cached)
         db.append_message(new.session_id, "user", "Keep the fresh user input")
         assert db.get_messages(new.session_id)[0]["content"] == "Keep the fresh user input"
+        assert db.get_messages(first.session_id)[-1]["content"] == "Keep the post-preview input"
 
 
 def test_selected_payload_erasure_clears_values_and_fts_but_keeps_other_rows(tmp_path):

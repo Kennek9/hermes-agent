@@ -47,7 +47,8 @@ origins require the caller's explicit `allow_legacy=True` selection.
 For an explicitly approved legacy source-session boundary, callers can also set
 `retire_session_scope=True`, with `allow_legacy=True` and no `expected_origin`.
 The selection must contain the complete message-ID prefix through its last row.
-Later rows stay intact. The transaction clears that prefix and ends the old
+Later rows and their row-identified recovery copies stay intact. The transaction
+clears that prefix and ends the old
 session as `owner_erasure`; an already-ended session keeps its original reason.
 A metadata-only scope mark prevents transcript writes, compaction and reopening
 of that session, and import skips its retired ID even if the session row was removed.

@@ -140,6 +140,14 @@ class SessionMessagesMixin:
         ).fetchone() is not None
 
     @staticmethod
+    def _session_scope_through_id(conn, session_id):
+        return conn.execute(
+            "SELECT max(json_extract(origin_key,'$.through_id')) FROM erased_message_origins "
+            "WHERE json_extract(origin_key,'$.scope')='session_prefix' "
+            "AND json_extract(origin_key,'$.session_id')=?", (session_id,),
+        ).fetchone()[0]
+
+    @staticmethod
     def _check_retired_session_scope(conn, session_id):
         if SessionMessagesMixin._session_scope_retired(conn, session_id):
             raise ValueError("session_scope_retired")
@@ -1684,7 +1692,7 @@ class SessionMessagesMixin:
             self._check_transcript_write_guards(
                 conn, session_id, None, reject_active_turn_lease=True,
                 reject_active_compression_lock=True, allow_closed_compression_parent=True,
-                allow_retired_session_scope=retire_session_scope,
+                allow_retired_session_scope=True,
             )
             rows = []
             for chunk in _id_chunks(selected):
@@ -1734,6 +1742,9 @@ class SessionMessagesMixin:
             if retire_session_scope:
                 conn.execute("INSERT OR IGNORE INTO erased_message_origins(origin_key) VALUES(?)",
                     (self._session_scope_key(session_id),))
+                conn.execute("INSERT OR IGNORE INTO erased_message_origins(origin_key) VALUES(?)",
+                    (self._origin_key({"scope":"session_prefix","session_id":session_id,
+                        "through_id":max(selected)}),))
                 changed = conn.execute(
                     "UPDATE sessions SET ended_at=?,end_reason='owner_erasure' "
                     "WHERE id=? AND ended_at IS NULL", (time.time(), session_id),
