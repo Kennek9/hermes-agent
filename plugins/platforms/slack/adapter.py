@@ -3580,8 +3580,7 @@ class SlackAdapter(BasePlatformAdapter):
             "team_id": team_id, "user_id": user_id}
 
     def _remember_processed_message_ts(self, ts: str) -> None:
-        """Claim a message ts for the ``message_changed`` guard: on entry (suppresses mid-flight
-        unfurls) and after construction (refreshes LRU recency). Bounded."""
+        """Remember an admitted message, with a bounded claim map."""
         if not ts:
             return
         self._processed_message_ts[ts] = time.time()
@@ -4248,7 +4247,12 @@ class SlackAdapter(BasePlatformAdapter):
                 chat_type="dm" if is_dm else "group")
         return True
 
-    def _normalize_changed_message(self, event: dict) -> Optional[dict]:
+    def _message_claim_key(self, team_id: str, channel_id: str, ts: str) -> str:
+        return self._workspace_event_id(team_id, f"{channel_id}:{ts}") if ts else ""
+
+    def _normalize_changed_message(
+        self, event: dict, payload: Optional[dict] = None,
+    ) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
         None if malformed or the original was already routed to the agent. The edit's own ts rides
         along as ``_slack_changed_event_ts`` for dedup."""
@@ -4256,8 +4260,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not isinstance(updated_message, dict):
             return None
         original_message_ts = str(updated_message.get("ts") or "")
-        if original_message_ts and original_message_ts in self._processed_message_ts:
-            return None
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
         outer_event_ts = str(event.get("ts") or "")
@@ -4269,6 +4271,13 @@ class SlackAdapter(BasePlatformAdapter):
         for key in ("channel", "channel_type", "team", "team_id"):
             if not normalized_event.get(key) and event.get(key):
                 normalized_event[key] = event.get(key)
+        claim_key = self._message_claim_key(
+            self._event_team_id(normalized_event, payload),
+            str(normalized_event.get("channel") or ""),
+            original_message_ts,
+        )
+        if claim_key in self._processed_message_ts:
+            return None
         if changed_event_ts:
             normalized_event["_slack_changed_event_ts"] = changed_event_ts
         return normalized_event
@@ -4591,25 +4600,6 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] message lifecycle observer failed")
 
 
-    async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
-        """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
-        turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
-        so a retry/edit can re-drive it. Pre-existing claims stay."""
-        _ts = str((event or {}).get("ts") or "")
-        # getattr: bare test doubles (object.__new__) may lack the map.
-        _claims = getattr(self, "_processed_message_ts", None)
-        _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
-        try:
-            return await self._handle_slack_message_impl(event, payload)
-        except BaseException:
-            _claims = getattr(self, "_processed_message_ts", None)
-            if _ts and not _was_claimed and _claims is not None and _ts in _claims:
-                _claims.pop(_ts, None)
-                logger.warning(
-                    "[%s] handler failed after claiming ts=%s; claim released "
-                    "so a retry or edit can re-drive the turn", self.name, _ts)
-            raise
-
     async def _drop_bot_sender(self, event: dict) -> bool:
         """allow_bots gate: ``none`` drops all bot posts (default), ``mentions`` those not
         @mentioning us, ``all`` accepts — own posts always drop (echo loops). Unlabeled events
@@ -4662,7 +4652,7 @@ class SlackAdapter(BasePlatformAdapter):
             bot = self._team_bot_user_ids.get(self._event_team_id(event, payload), self._bot_user_id)
             if not isinstance(updated, dict) or not bot or f"<@{bot}>" not in _slack_mention_detection_text(updated):
                 return None
-            event = self._normalize_changed_message(event)
+            event = self._normalize_changed_message(event, payload)
             if event is None:
                 return None
         # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
@@ -4746,7 +4736,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._register_mentioned_thread(thread_ts, team_id=team_id)
         return text, original_text, command_probe_text, is_command_text
 
-    async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> None:
+    async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
         """Handle an incoming Slack message event."""
         accepted = await self._prefilter_inbound(event, payload)
         if accepted is None:
@@ -4824,46 +4814,53 @@ class SlackAdapter(BasePlatformAdapter):
             event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=is_dm,
             force_process=force_process)):
             return
-        # Claim the message ts HERE: a link unfurl emits `message_changed` with a different event
-        # ts, so only the `_processed_message_ts` guard stops a duplicate turn, and it must be set
-        # before the slow enrichment awaits. Claiming before the filters would let an ignored
-        # original block a later "@bot" edit from summoning the bot.
-        _claim_ts = str(event.get("ts") or "")
-        if _claim_ts:
-            self._remember_processed_message_ts(_claim_ts)
-        if is_mentioned:
-            text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
-                text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
-                team_id)
-        # Thread history stays out of ``text``: prepending would push a command off char zero.
-        (
-            channel_context, thread_root_media_urls, thread_root_media_types,
-        ) = await self._hydrate_thread_context(
-            channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
-            team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
-            is_dm=is_dm)
-        # Thread-root media is delivered ahead of the trigger message's own files.
-        media_urls, media_types, media_text_inlined, text = await self._collect_inbound_media(
-            event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
-        msg_event = await self._build_message_event(
-            event, text=text, original_text=original_text, command_probe_text=command_probe_text,
-            is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
-            user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
-            media_types=media_types, media_text_inlined=media_text_inlined, channel_context=channel_context)
-        # React only when directly addressed; MPIMs are shared, so they need a
-        # mention like any channel.
-        if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
-            self._track_reacting_message(team_id, ts)
-        # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
-        # the agent per view switch and leak stale context). Inert label, never a channel body.
-        context_channel_id = agent_context.get("context_channel_id", "")
-        if context_channel_id and context_channel_id != channel_id and not is_command_text:
-            msg_event.text = (
-                f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
-                f"{msg_event.text}")
-        if ts:
-            self._remember_processed_message_ts(ts)
-        await self.handle_message(msg_event)
+        # Creation and edit events can arrive in either order. Claim the original
+        # message only after admission so an ignored message can still be edited
+        # to mention the bot.
+        claim_key = self._message_claim_key(team_id, channel_id, ts)
+        if claim_key in self._processed_message_ts:
+            return
+        self._remember_processed_message_ts(claim_key)
+        claimed_at = self._processed_message_ts.get(claim_key)
+        try:
+            if is_mentioned:
+                text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
+                    text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
+                    team_id)
+            # Thread history stays out of ``text``: prepending would push a command off char zero.
+            (
+                channel_context, thread_root_media_urls, thread_root_media_types,
+            ) = await self._hydrate_thread_context(
+                channel_id=channel_id, event_thread_ts=event_thread_ts, ts=ts, user_id=user_id,
+                team_id=team_id, is_thread_reply=is_thread_reply, is_mentioned=is_mentioned,
+                is_dm=is_dm)
+            # Thread-root media is delivered ahead of the trigger message's own files.
+            media_urls, media_types, media_text_inlined, text = await self._collect_inbound_media(
+                event, channel_id, team_id, text, thread_root_media_urls, thread_root_media_types)
+            msg_event = await self._build_message_event(
+                event, text=text, original_text=original_text, command_probe_text=command_probe_text,
+                is_command_text=is_command_text, channel_id=channel_id, team_id=team_id, ts=ts,
+                user_id=user_id, thread_ts=thread_ts, is_dm=is_dm, media_urls=media_urls,
+                media_types=media_types, media_text_inlined=media_text_inlined, channel_context=channel_context)
+            # React only when directly addressed; MPIMs are shared, so they need a
+            # mention like any channel.
+            if (is_one_to_one_dm or is_mentioned) and self._reactions_enabled():
+                self._track_reacting_message(team_id, ts)
+            # App-context is per-turn UI state: in the user message, not SessionSource (would rebuild
+            # the agent per view switch and leak stale context). Inert label, never a channel body.
+            context_channel_id = agent_context.get("context_channel_id", "")
+            if context_channel_id and context_channel_id != channel_id and not is_command_text:
+                msg_event.text = (
+                    f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
+                    f"{msg_event.text}")
+            await self.handle_message(msg_event)
+        except BaseException:
+            if claimed_at is not None and self._processed_message_ts.get(claim_key) == claimed_at:
+                self._processed_message_ts.pop(claim_key, None)
+                logger.warning(
+                    "[%s] handler failed after claiming ts=%s; claim released "
+                    "so a retry or edit can re-drive the turn", self.name, ts)
+            raise
 
     async def _build_message_event(
         self, event: dict, *, text: str, original_text: str, command_probe_text: str,

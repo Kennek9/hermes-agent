@@ -179,7 +179,7 @@ async def test_revision_passes_native_gateway_authorization_and_never_starts_cha
     )
     runner = SimpleNamespace(_is_user_authorized_for_source=lambda source: authorized)
     adapter = SlackAdapter(PlatformConfig(enabled=False))
-    adapter._processed_message_ts["123.456"] = 1
+    adapter._processed_message_ts["T_LOCAL:C_LOCAL:123.456"] = 1
     adapter._resolve_user_is_bot = AsyncMock(
         side_effect=AssertionError("no SDK probe for revisions")
     )
@@ -213,7 +213,7 @@ async def test_revision_passes_native_gateway_authorization_and_never_starts_cha
 )
 async def test_unverifiable_revision_never_reaches_observer(problem):
     adapter = SlackAdapter(PlatformConfig(enabled=False))
-    adapter._processed_message_ts["123.456"] = 1
+    adapter._processed_message_ts["T_LOCAL:C_LOCAL:123.456"] = 1
     observer = AsyncMock()
     adapter.set_platform_event_handler(observer)
     value = revision()

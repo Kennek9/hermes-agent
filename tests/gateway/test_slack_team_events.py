@@ -25,7 +25,7 @@ def event(kind="message_changed"):
 @pytest.mark.parametrize("kind", ["message_changed", "message_deleted"])
 async def test_source_lifecycle_survives_chat_early_returns(kind):
     adapter = SlackAdapter(PlatformConfig(enabled=False))
-    adapter._processed_message_ts["123.456"] = True
+    adapter._processed_message_ts["T_LOCAL:D_LOCAL:123.456"] = True
     handler = AsyncMock()
     adapter.set_platform_event_handler(handler)
     adapter.handle_message = AsyncMock()
@@ -50,7 +50,7 @@ async def test_source_lifecycle_survives_chat_early_returns(kind):
 @pytest.mark.parametrize("problem", ["author", "workspace", "previous", "timestamp", "message_id", "previous_workspace"])
 async def test_unverifiable_source_lifecycle_is_not_dispatched(problem):
     adapter = SlackAdapter(PlatformConfig(enabled=False))
-    adapter._processed_message_ts["123.456"] = True
+    adapter._processed_message_ts["T_LOCAL:D_LOCAL:123.456"] = True
     handler = AsyncMock()
     adapter.set_platform_event_handler(handler)
     value = event()
@@ -74,7 +74,7 @@ async def test_unverifiable_source_lifecycle_is_not_dispatched(problem):
 @pytest.mark.asyncio
 async def test_observer_failure_does_not_escape_adapter():
     adapter = SlackAdapter(PlatformConfig(enabled=False))
-    adapter._processed_message_ts["123.456"] = True
+    adapter._processed_message_ts["T_LOCAL:D_LOCAL:123.456"] = True
     adapter.set_platform_event_handler(AsyncMock(side_effect=RuntimeError("synthetic observer failure")))
     await adapter._handle_slack_message(event(), {"team_id": "T_LOCAL", "event_id": "Ev1"})
 
