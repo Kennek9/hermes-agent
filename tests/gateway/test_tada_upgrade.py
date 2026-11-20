@@ -16,13 +16,24 @@ def test_installed_plugins_register_with_real_manager(tmp_path, monkeypatch, tad
         (tmp_path / 'plugins' / name).symlink_to(tada_release_plugin_parent / name)
     (tmp_path / 'config.yaml').write_text('plugins:\n  enabled: [company_knowledge_v1, table_workflows]\n')
     from hermes_cli.plugins import PluginManager
+    from tools.registry import registry
+
     manager = PluginManager(scope_key=str(tmp_path))
     manager.discover_and_load()
     for name in ('company_knowledge_v1', 'table_workflows'):
         plugin = manager._plugins.get(name)
         assert plugin is not None, name
         assert plugin.enabled and not plugin.error, (name, plugin.error)
-    assert {'knowledge.ask','knowledge.read_document','conversation.memory','workspace.continuity','tables.workflow'} <= manager._plugin_tool_names
+    assert {
+        'tada_knowledge_search', 'knowledge.read_document', 'conversation.memory',
+        'workspace.continuity', 'tables.workflow',
+    } <= manager._plugin_tool_names
+    assert 'knowledge.ask' not in manager._plugin_tool_names
+    search = registry.get_entry('tada_knowledge_search', scope=manager.scope_key)
+    assert search is not None and search.model_visible
+    assert {'query', 'intent'} <= set(search.schema['parameters']['required'])
+    assert 'source' not in search.schema['parameters']['properties']
+    assert registry.get_entry('knowledge.ask', scope=manager.scope_key) is None
     assert {'gateway_delivery','context_handoff','gateway_platform_event'} <= manager._hooks.keys()
 
 
@@ -56,37 +67,68 @@ def test_native_transport_maps_tool_result_back_to_public_name():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('locale,receipt', [
-    ('zh-CN', '已收到，等待后台处理'),
-    ('en-US', 'Received. Waiting for background processing.'),
-])
-async def test_busy_weixin_intake_persists_before_agent_routing(tmp_path, monkeypatch, tada_release_plugin_parent, locale, receipt):
+@pytest.mark.parametrize('locale', ['zh-CN', 'en-US'])
+async def test_busy_weixin_message_queues_without_retired_intake(
+    tmp_path, monkeypatch, tada_release_plugin_parent, locale,
+):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('TADA_DEFAULT_LOCALE', locale)
     monkeypatch.setenv('TADA_WEIXIN_COMPANY_SHARED', 'true')
     monkeypatch.setenv('TADA_WEIXIN_EMPLOYEE_ID', 'employee')
     monkeypatch.syspath_prepend(str(tada_release_plugin_parent))
-    from company_knowledge_v1 import weixin, weixin_jobs, settings
-    settings.configure(SimpleNamespace(get_config=lambda key, default=None: locale if key == 'default_locale' else default))
-    import hermes_cli.lifecycle
-    from gateway.config import Platform
-    from gateway.platforms.base import MessageEvent, MessageType
-    from gateway.session import SessionSource
-    from gateway.run_busy import GatewayBusySessionMixin
-    cache = tmp_path / 'cache'; cache.mkdir()
-    attachment=cache/'busy.txt';attachment.write_text('Upgrade attachment acceptance')
-    event=MessageEvent(text='',message_type=MessageType.TEXT,
-        source=SessionSource(platform=Platform.WEIXIN,chat_id='peer',user_id='employee',chat_type='dm'),
-        message_id='busy-acceptance',media_urls=[str(attachment)],media_types=['text/plain'])
-    adapter=SimpleNamespace(_send_with_retry=AsyncMock())
-    runner=SimpleNamespace(_is_user_authorized_for_source=lambda s:True,
-        _admit_bot_message_for_source=lambda s:True,_delivery_adapter_for=lambda s:adapter)
-    monkeypatch.setattr(hermes_cli.lifecycle,'invoke_hook',lambda name,**kw:[weixin.pre_gateway_dispatch(**kw)])
-    assert await GatewayBusySessionMixin._handle_active_session_busy_message(runner,event,'session') is True
-    assert adapter._send_with_retry.await_count == 1
-    assert adapter._send_with_retry.call_args.kwargs['content'] == receipt
-    import sqlite3
-    with sqlite3.connect(weixin_jobs.job_database()) as connection:
-        assert connection.execute('SELECT count(*) FROM jobs').fetchone()[0] == 1
+    (tmp_path / 'plugins').mkdir()
+    (tmp_path / 'plugins' / 'company_knowledge_v1').symlink_to(tada_release_plugin_parent / 'company_knowledge_v1')
+    (tmp_path / 'config.yaml').write_text('plugins:\n  enabled: [company_knowledge_v1]\n')
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.platforms.weixin import WeixinAdapter
+    from gateway.run import GatewayRunner
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    manager.discover_and_load()
+    plugin = manager._plugins['company_knowledge_v1']
+    assert plugin.enabled and not plugin.error, plugin.error
+    assert 'pre_gateway_dispatch' in manager._hooks
+
+    adapter = WeixinAdapter(PlatformConfig(enabled=True, extra={
+        'dm_policy': 'allowlist', 'allow_from': ['employee'],
+    }))
+    send = AsyncMock()
+    monkeypatch.setattr(adapter, '_send_with_retry', send)
+    start_turn = AsyncMock()
+    adapter.set_message_handler(start_turn)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {Platform.WEIXIN: adapter}
+    runner._busy_input_mode = runner._busy_text_mode = 'queue'
+    runner._draining = False
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    cache = tmp_path / 'cache'
+    cache.mkdir()
+    attachment = cache / 'busy.txt'
+    attachment.write_text('Upgrade attachment acceptance')
+    event = MessageEvent(
+        text='', message_type=MessageType.TEXT,
+        source=adapter.build_source(chat_id='peer', user_id='employee', chat_type='dm'),
+        message_id='busy-acceptance', media_urls=[str(attachment)], media_types=['text/plain'],
+    )
+    key = adapter._event_session_key(event)
+    guard = asyncio.Event()
+    adapter._active_sessions[key] = guard
+
+    await adapter.handle_message(event)
+
+    assert event._bot_loop_admitted and event._gateway_accepted
+    assert adapter._pending_messages[key] is event
+    assert event.media_urls == [str(attachment)]
+    assert adapter._active_sessions[key] is guard and not guard.is_set()
+    start_turn.assert_not_awaited()
+    send.assert_not_awaited()
+    assert not (tmp_path / 'weixin-jobs.sqlite').exists()
+    assert not (tmp_path / 'weixin_uploads').exists()
+    assert attachment.read_text() == 'Upgrade attachment acceptance'
 
 
 def test_context_notice_survives_turn_cleanup_but_resets_with_conversation(monkeypatch):
