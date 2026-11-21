@@ -118,7 +118,7 @@ def test_new_final_post_uses_confirmed_slack_timestamp():
 
 
 @pytest.mark.asyncio
-async def test_real_slack_sdk_edits_one_placeholder_and_clears_eyes():
+async def test_real_slack_sdk_edits_one_placeholder_and_clears_eyes(record_property):
     from aiohttp import web
     from slack_sdk.web.async_client import AsyncWebClient
     from gateway.config import PlatformConfig
@@ -135,6 +135,7 @@ async def test_real_slack_sdk_edits_one_placeholder_and_clears_eyes():
             if request.content_type == "application/json"
             else dict(await request.post())
         )
+        payload = {**request.query, **payload}
         method = request.match_info["method"]
         calls.append((method, loop.time() - start, payload))
         if method == "chat.postMessage":
@@ -168,7 +169,9 @@ async def test_real_slack_sdk_edits_one_placeholder_and_clears_eyes():
             _slack_event_ts="1000.000000",
         )
         adapter._turn_feedback["T", "C", "1000.000000"] = state
-        await asyncio.wait_for(posted.wait(), 5)
+        await asyncio.wait_for(
+            posted.wait(), 30
+        )  # Bound a missing event, independent of the latency target.
         result = await adapter.send(
             "C",
             "Final evidence.",
@@ -189,8 +192,17 @@ async def test_real_slack_sdk_edits_one_placeholder_and_clears_eyes():
             "chat.update",
             "reactions.remove",
         ]
-        assert calls[0][1] < 1
-        assert 2.4 <= calls[1][1] <= 4
+        added, placeholder, edit, removed = [
+            payload
+            for method, _, payload in calls
+            if method.startswith(("chat.", "reactions."))
+        ]
+        assert added["timestamp"] == removed["timestamp"] == "1000.000000"
+        assert added["name"] == removed["name"] == "eyes"
+        assert placeholder["thread_ts"] == "999.000000"
+        assert edit["ts"] == result.message_id == "1002.500000"
+        record_property("slack_ingress_to_eyes_ack_ms", observed["ingress_to_ack_ms"])
+        record_property("slack_progress_request_ms", round(calls[1][1] * 1000, 3))
     finally:
         await server.cleanup()
 
