@@ -113,3 +113,24 @@ def test_cache_affinity_is_workspace_and_profile_scoped(tmp_path, monkeypatch):
     assert key(home, "T1", "thread-one") != key(
         tmp_path / "profile2", "T1", "thread-one"
     )
+
+
+@pytest.mark.parametrize(
+    "details,expected",
+    [({}, None), ({"cached_tokens": 0}, 0), ({"cached_tokens": 1024}, 1024)],
+)
+def test_usage_receipt_distinguishes_missing_cache_counter(details, expected):
+    from agent.api_request_hooks import ApiRequestHooksMixin
+
+    wire = {
+        "input_tokens": 2000,
+        "output_tokens": 240,
+        "input_tokens_details": details,
+        "output_tokens_details": {"reasoning_tokens": 140},
+    }
+    receipt = ApiRequestHooksMixin._usage_summary_for_api_request_hook(
+        NS(provider="custom", api_mode="codex_responses"), NS(usage=wire)
+    )
+    assert receipt["observed_cache_read_tokens"] == expected
+    assert receipt["observed_reasoning_tokens"] == 140
+    assert "observed_cache_write_tokens" not in receipt
