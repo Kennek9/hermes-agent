@@ -911,6 +911,11 @@ class TurnRunner:
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
+        if platform_key == "slack":
+            adapter = self._runner._delivery_adapter_for(ctx.source)
+            if adapter is not None and getattr(getattr(adapter, "config", None), "extra", {}).get("thread_feedback") is True:
+                # The accepted turn owns one progress post and its final ledgered edit.
+                return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
         # run_sync only reads it via the holder for delta-callback wiring.

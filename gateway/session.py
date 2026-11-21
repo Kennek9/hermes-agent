@@ -1069,6 +1069,10 @@ class SessionStore(
         self._record_gateway_session_peer(
             peer_sid, session_key, peer_origin, display_name=peer_name, transport_profile=peer_transport)
 
+    def slack_thread_participation(self, session_key, workspace, channel, thread, user, *, refresh=False):
+        db = self._db_for_key(session_key)
+        return bool(db and db.slack_thread_participation(workspace, channel, thread, user, refresh=refresh))
+
     def get_session_metadata(self, session_key: str, key: str, default: Any = None) -> Any:
         """Return a metadata value stored on a live session entry."""
         with self._lock:

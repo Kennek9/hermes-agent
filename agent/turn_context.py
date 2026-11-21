@@ -605,6 +605,9 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         agent._replay_compression_warning()
         agent._compression_warning = None  # send once
 
+    agent._turn_qa_limit = None
+    agent._turn_qa_effort = None
+    agent._turn_qa_locale = None
     agent.iteration_budget = IterationBudget(agent.max_iterations)
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
     agent._run_budget_started_at = (
@@ -778,6 +781,16 @@ def _collect_pre_llm_call_context(
             _spill_config_cached = None
         _ctx_parts: list[str] = []
         for r in _pre_results:
+            # Only structured host hook output can narrow a Slack turn. User/tool
+            # message text is never parsed as policy. Keep cached agent defaults intact.
+            if isinstance(r, dict) and getattr(agent, "platform", None) == "slack":
+                policy = r.get("qa_mode")
+                if policy in ("fast_qa", "deep_qa"):
+                    cap = min(agent.max_iterations, 3 if policy == "fast_qa" else 8)
+                    agent._turn_qa_limit = cap
+                    agent._turn_qa_locale = r.get("reply_locale")
+                    agent._turn_qa_effort = "low" if policy == "fast_qa" else "high"
+                    agent.iteration_budget = IterationBudget(cap)
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
             elif isinstance(r, str) and r.strip():

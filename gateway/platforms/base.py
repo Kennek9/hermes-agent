@@ -1652,6 +1652,7 @@ class SendResult:
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None
+    slack_final_ts: Optional[str] = None
 
 
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
@@ -4279,6 +4280,9 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
+        if getattr(event, "_slack_feedback", None) is not None:
+            metadata = {**(metadata or {}), "final_for_message_id": event.message_id,
+                        "slack_team_id": event.source.scope_id}
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         from gateway.execution_clock import text_receipt

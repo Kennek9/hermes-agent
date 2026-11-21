@@ -15,6 +15,7 @@ import os
 import queue
 import threading
 import time
+from gateway.slack_turn_notice import notice as slack_notice
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -901,6 +902,8 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_notify(self, source, meta, message, what):
         """Best-effort user notice on the hygiene thread; failure is logged, never raised."""
+        if getattr(source.platform, "value", source.platform) == "slack":
+            return  # The existing fenced background compressor retains its operator log.
         try:
             _adapter = self._delivery_adapter_for(source)
             if _adapter and source.chat_id:
@@ -1354,6 +1357,9 @@ class GatewayTurnMixin:
             return history
 
         hs = await self._hmwa_hygiene_settings(source, session_key)
+        if getattr(source.platform, "value", source.platform) == "slack":
+            hs.max_turn_hold_seconds = 0.05
+
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).
         if not hs.compression_enabled:
             return self._bound_hygiene_payload(history, hs, session_entry)
@@ -1519,6 +1525,12 @@ class GatewayTurnMixin:
             _model = str(agent_result.get("model") or "").strip() or "The model"
             response = "⚠️ " + EMPTY_RESPONSE_EXPLANATION.format(model=_model)
         agent_messages = agent_result.get("messages", [])
+        if _platform_name == "slack" and not _intentional_silence:
+            failed = agent_result.get("failed") or agent_result.get("turn_exit_reason") == "session_persistence_failed"
+            if failed or not response or response == _UNEXPECTED_SILENCE_REPLY or agent_result.get("final_response") == "(empty)":
+                authored = next((m.get("content","") for m in reversed(agent_messages)
+                                 if isinstance(m, dict) and m.get("role") == "user"), "")
+                response = slack_notice("unavailable" if failed else "empty", authored)
         logger.info(
             "response ready: platform=%s chat=%s session=%s time=%.1fs api_calls=%d response=%d chars",
             _platform_name, source.chat_id or "unknown", session_key or "unknown",
@@ -1776,6 +1788,8 @@ class GatewayTurnMixin:
                 await asyncio.to_thread(
                     self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
                 )
+            if source.platform == Platform.SLACK:
+                return response, session_entry
             response = (response or "") + (
                 "\n\n🔄 Session auto-reset — the conversation exceeded the maximum context size and "
                 "could not be compressed further. Your next message will start a fresh session."
@@ -1961,6 +1975,8 @@ class GatewayTurnMixin:
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
             # no-grow rule as the persist path (#1630) — nothing is written into an oversized session.
+            if source.platform == Platform.SLACK:
+                return slack_notice("unavailable", event.text)
             from gateway.run import _CONTEXT_OVERFLOW_REPLY
             return _CONTEXT_OVERFLOW_REPLY
         # Replay can coalesce inputs; only this input's durable marker establishes ownership.
@@ -1978,6 +1994,8 @@ class GatewayTurnMixin:
         except Exception:
             logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
         # Never expose raw exception types/messages to end users (info-leakage risk).
+        if source.platform == Platform.SLACK:
+            return slack_notice("unavailable", event.text)
         status_hint = self._STATUS_HINTS.get(status_code, "")
         if status_code == 401:
             from agent.turn_failure_copy import relogin_command_hint
@@ -2076,6 +2094,8 @@ class GatewayTurnMixin:
             )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
+            if getattr(source.platform, "value", source.platform) == "slack":
+                return slack_notice("history", event.text), _session_env_tokens
             return (
                 "⚠️ This session's history is temporarily unavailable, so this message was not "
                 "processed. Ask the operator to inspect state.db, then resend after it is healthy. "
@@ -2221,7 +2241,7 @@ class GatewayTurnMixin:
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if agent_failed_early and not is_context_overflow_failure:
+            if agent_failed_early and not is_context_overflow_failure and source.platform != Platform.SLACK:
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
@@ -3479,7 +3499,7 @@ class GatewayTurnMixin:
         """Staged one-shot warning before the inactivity timeout escalates."""
         from gateway.run import _interim_metadata
         _warn_adapter = self._delivery_adapter_for(source)
-        if not _warn_adapter:
+        if not _warn_adapter or getattr(source.platform, "value", source.platform) == "slack":
             return
         try:
             await _warn_adapter.emit_warning(
@@ -3533,6 +3553,8 @@ class GatewayTurnMixin:
             "To increase the limit, set agent.gateway_timeout in config.yaml (value in seconds, 0 "
             "= no limit) and restart the gateway.\nTry again, or use /reset to start fresh."
         )
+        if getattr(turn_ctx.source.platform, "value", turn_ctx.source.platform) == "slack":
+            _diag_lines = [slack_notice("timeout", turn_ctx.message)]
         return {
             "final_response": "\n".join(_diag_lines),
             "messages": result_holder[0].get("messages", []) if result_holder[0] else [],

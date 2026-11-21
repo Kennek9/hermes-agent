@@ -326,6 +326,13 @@ _FTS_TRIGGERS = ("messages_fts_insert", "messages_fts_delete", "messages_fts_upd
                  "messages_fts_trigram_insert", "messages_fts_trigram_delete", "messages_fts_trigram_update")
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS slack_mentioned_threads (
+    workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
+    user_id TEXT NOT NULL, last_active_at INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id,channel_id,thread_ts,user_id)
+);
+CREATE INDEX IF NOT EXISTS slack_thread_expiry ON slack_mentioned_threads(last_active_at);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );

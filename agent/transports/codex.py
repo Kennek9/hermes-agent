@@ -359,7 +359,10 @@ def _default_prompt_cache_retention_for_request(model: str, base_url: Any) -> Op
     if not is_bedrock_mantle:
         return None
     normalized = str(model or "").strip().lower().replace("_", "-")
-    return "24h" if _EXTENDED_PROMPT_CACHE_MODEL_RE.search(normalized) else None
+    extended = _EXTENDED_PROMPT_CACHE_MODEL_RE.search(normalized) or re.fullmatch(
+        r"(?:openai[./:])?gpt-6(?:[.-][a-z0-9]+)*", normalized
+    )
+    return "24h" if extended else None
 
 
 def _is_openai_api_origin(base_url: Any) -> bool:
@@ -410,6 +413,20 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
     include = kwargs.get("include")
     if isinstance(include, list):
         kwargs["include"] = [item for item in include if "logprob" not in str(item).lower()]
+
+
+def _slack_prefix_scope(fallback: str) -> str:
+    """Shard provider prefill within a trusted workspace/profile, never transcript identity."""
+    from gateway.session_context import get_trusted_session_value
+    if get_trusted_session_value("HERMES_SESSION_PLATFORM") != "slack":
+        return fallback
+    team = get_trusted_session_value("HERMES_SESSION_SCOPE_ID")
+    if not team:
+        return fallback
+    from hermes_constants import get_hermes_home
+    user = get_trusted_session_value("HERMES_SESSION_USER_ID")
+    bucket = hashlib.sha256(user.encode()).digest()[0] % 4
+    return f"slack:{get_hermes_home()}:{team}:{bucket}"
 
 
 def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]], scope_id: str = "") -> Optional[str]:
@@ -732,7 +749,7 @@ class ResponsesApiTransport(ProviderTransport):
         # Content-addressed (instructions + tools) within a logical scope that survives
         # compression rotation; session_id itself stays untouched for transcript isolation.
         _cache_scope = _cache_scope_from_session_id(params.get("cache_scope_id") or session_id)
-        cache_key = _content_cache_key(instructions, response_tools, _cache_scope) or _cache_scope
+        cache_key = _content_cache_key(instructions, response_tools, _slack_prefix_scope(_cache_scope)) or _cache_scope
         # xAI takes prompt_cache_key in extra_body (below); GitHub Models opts out entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
             kwargs["prompt_cache_key"] = cache_key

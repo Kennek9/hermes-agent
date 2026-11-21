@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import math
 import os
+import re
 import time
 from uuid import uuid4
 
@@ -50,6 +51,10 @@ def invalidate(event):
     """Merged or redirected inputs no longer have a unique inbound measurement."""
     event._execution_clock_started = True
     event._execution_received_clock = None
+    feedback = getattr(event, "_slack_feedback", None)
+    if feedback is not None:
+        feedback.discard()
+        event._slack_feedback = None
 
 
 def _fingerprint(text):
@@ -175,6 +180,7 @@ def text_receipt(event, text, result):
         raw = getattr(result, "raw_response", None)
         if not isinstance(raw, dict) or not raw.get("skipped"):
             event._execution_final_clock = reading()
+            event._execution_slack_final_ts = getattr(result, "slack_final_ts", None)
             event._execution_first_final_clock = (
                 None if _split_receipt(result) else event._execution_final_clock
             )
@@ -186,7 +192,6 @@ def timings(event, *, confirmed):
     identity = getattr(event, "_execution_observation", {})
     if (
         not _valid(start)
-        or identity.get("generation_failed")
         or getattr(event, "reply_anchor_override", None)
     ):
         return {}
@@ -198,6 +203,17 @@ def timings(event, *, confirmed):
         "observed_at": observed["wall"],
         "observed_elapsed_ms": (observed["tick"] - start["tick"]) * 1000,
     }
+    feedback = getattr(event, "_slack_feedback", None)
+    ack = getattr(feedback, "ack", None)
+    if _valid(ack) and start["tick"] <= ack["tick"] <= observed["tick"]:
+        result.update(eyes_ack_at=ack["wall"], ingress_to_ack_ms=(ack["tick"] - start["tick"]) * 1000)
+    if identity.get("generation_failed"):
+        return result if _valid(ack) else {}
+    event_ts = getattr(event, "_slack_event_ts", None)
+    final_ts = getattr(event, "_execution_slack_final_ts", None)
+    if confirmed and all(isinstance(v, str) and re.fullmatch(r"\d{1,12}\.\d{1,6}", v) for v in (event_ts, final_ts)):
+        if float(final_ts) >= float(event_ts):
+            result.update(slack_final_ts=final_ts, slack_ingress_event_ts=event_ts)
     final = getattr(event, "_execution_final_clock", None)
     candidates = [
         identity.get("first_text_clock"),
