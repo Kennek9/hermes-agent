@@ -1079,6 +1079,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Bot-sent message ts / @mentioned threads: replies there get answered without a mention.
         self._bot_message_ts: set[str] = set()
         self._mentioned_threads: set[str] = set()
+        self._turn_feedback = {}
         # (team_id, channel_id, thread_ts) → Assistant thread metadata; lifecycle
         # events may precede message events and carry session-scoping identity.
         self._assistant_threads: Dict[Tuple[str, str, str], Dict[str, str]] = {}
@@ -2350,6 +2351,13 @@ class SlackAdapter(BasePlatformAdapter):
                 # stay stuck on "is thinking..." (#24117).
                 return SendResult(success=True)
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            final_key = (team_id, chat_id, (metadata or {}).get("final_for_message_id"))
+            feedback = getattr(self, "_turn_feedback", {}).get(final_key)
+            if feedback is not None and (posted := await feedback.finish_progress()):
+                if len(formatted) <= self.MAX_MESSAGE_LENGTH:
+                    result = await self.edit_message(chat_id, posted, content, finalize=True, metadata=metadata)
+                    feedback.finalized = result.success
+                    return result
             last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -2362,7 +2370,8 @@ class SlackAdapter(BasePlatformAdapter):
                 if thread_ts:
                     self._bot_message_ts.add(self._workspace_message_marker(team_id, thread_ts))
                 self._trim_bot_message_timestamps()
-            return SendResult(success=True, message_id=sent_ts, raw_response=last_result)
+            return SendResult(success=True, message_id=sent_ts, raw_response=last_result,
+                              slack_final_ts=sent_ts if last_result and last_result.get("ok") else None)
         except Exception as e:  # pragma: no cover - defensive logging
             # Clear the status even when the failure preceded thread_ts resolution:
             # stop_typing falls back to metadata / the uniquely tracked status.
@@ -2509,11 +2518,14 @@ class SlackAdapter(BasePlatformAdapter):
                 blocks = self._maybe_blocks(content)
                 if blocks:
                     update_kwargs["blocks"] = blocks
-            await self._call_with_block_fallback(
+            response = await self._call_with_block_fallback(
                 lambda: self._client_for(chat_id, metadata), "chat_update", update_kwargs, "edit")
             if finalize:
                 await self._clear_thread_status_quietly(chat_id, metadata)
-            return SendResult(success=True, message_id=message_id)
+            message = response.get("message") if response and response.get("ok") else None
+            edited = message.get("edited") if isinstance(message, dict) else None
+            final_ts = edited.get("ts") if finalize and isinstance(edited, dict) else None
+            return SendResult(success=True, message_id=message_id, slack_final_ts=final_ts)
         except Exception as e:  # pragma: no cover - defensive logging
             if finalize:
                 await self._clear_thread_status_quietly(chat_id, metadata)
@@ -3227,8 +3239,8 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(channel, team_id=team_id or None)
             method = client.reactions_remove if remove else client.reactions_add
-            await method(channel=channel, timestamp=timestamp, name=emoji)
-            return True
+            response = await method(channel=channel, timestamp=timestamp, name=emoji)
+            return response.get("ok") is True
         except Exception as e:
             logger.debug(
                 "[Slack] reactions.%s failed (%s): %s", "remove" if remove else "add", emoji, e)
@@ -3258,6 +3270,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        if getattr(event, "_slack_feedback", None) is not None:
+            return
         target = self._reacting_target(event)
         if target is None:
             return
@@ -3268,6 +3282,12 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        feedback = getattr(event, "_slack_feedback", None)
+        if feedback is not None:
+            self._turn_feedback.pop((feedback.team, feedback.channel, feedback.message), None)
+            self._reacting_message_ids.discard(self._workspace_message_marker(feedback.team, feedback.message))
+            await feedback.close()
+            return
         target = self._reacting_target(event)
         if target is None:
             return
@@ -4079,6 +4099,17 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
+    async def _remembered_participant(self, team, channel, thread, user, *, refresh=False):
+        key = self._build_thread_session_key(channel, thread, user, team_id=team)
+        if not key or not team or not thread:
+            return False
+        try:
+            return await asyncio.to_thread(self._session_store.slack_thread_participation,
+                key, team, channel, thread, user, refresh=refresh)
+        except Exception:
+            logger.warning("[Slack] thread participation store unavailable", exc_info=True)
+            return False
+
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
         """Record a thread as bot-mentioned so future replies auto-trigger.
         Markers are workspace-scoped when team_id is known so identical thread ts values in two
@@ -4241,6 +4272,9 @@ class SlackAdapter(BasePlatformAdapter):
         if free_channel:
             return True
         if not is_mentioned:
+            if self.config.extra.get("remember_mentioned_threads"):
+                return bool(is_thread_reply and await self._remembered_participant(
+                    team_id, channel_id, event_thread_ts, user_id))
             return await self._should_wake_on_unmentioned_message(
                 event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
                 team_id=team_id, is_thread_reply=is_thread_reply,
@@ -4738,6 +4772,8 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
         """Handle an incoming Slack message event."""
+        from gateway.execution_clock import reading
+        ingress = reading()
         accepted = await self._prefilter_inbound(event, payload)
         if accepted is None:
             return
@@ -4822,11 +4858,22 @@ class SlackAdapter(BasePlatformAdapter):
             return
         self._remember_processed_message_ts(claim_key)
         claimed_at = self._processed_message_ts.get(claim_key)
+        feedback = None
+        feedback_key = (team_id, channel_id, ts)
+        if (self.config.extra.get("thread_feedback") is True and team_id and ts
+                and not is_command_text and not self._outbound_blocked(channel_id, "turn feedback")):
+            from plugins.platforms.slack.turn_feedback import TurnFeedback
+            feedback = TurnFeedback(self, team_id, channel_id, thread_ts or ts, ts, ingress,
+                                    bool(re.search(r"[\u3400-\u9fff]", original_text)))
+            self._turn_feedback[feedback_key] = feedback
         try:
             if is_mentioned:
                 text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                     text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
                     team_id)
+            if (self.config.extra.get("remember_mentioned_threads") and not is_dm and thread_ts
+                    and (is_mentioned or is_thread_reply) and not is_command_text):
+                await self._remembered_participant(team_id, channel_id, thread_ts, user_id, refresh=True)
             # Thread history stays out of ``text``: prepending would push a command off char zero.
             (
                 channel_context, thread_root_media_urls, thread_root_media_types,
@@ -4853,8 +4900,18 @@ class SlackAdapter(BasePlatformAdapter):
                 msg_event.text = (
                     f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                     f"{msg_event.text}")
+            if feedback is not None:
+                msg_event._execution_clock_started = True
+                msg_event._execution_received_clock = ingress
+                msg_event._slack_feedback = feedback
+                msg_event._slack_event_ts = event.get("_slack_changed_event_ts") or event.get("event_ts")
             await self.handle_message(msg_event)
+            if feedback is not None and not getattr(msg_event, "_gateway_accepted", False):
+                self._turn_feedback.pop(feedback_key, None)
+                await feedback.close()
         except BaseException:
+            if feedback is not None and self._turn_feedback.pop(feedback_key, None) is not None:
+                await feedback.close()
             if claimed_at is not None and self._processed_message_ts.get(claim_key) == claimed_at:
                 self._processed_message_ts.pop(claim_key, None)
                 logger.warning(

@@ -372,6 +372,11 @@ class TurnExplainersMixin:
                     break
         if body is not None and "{model}" in body:
             body = body.format(model=model or "The model")
+        if reason == "session_persistence_failed":
+            from gateway.session_context import get_trusted_session_value
+            if get_trusted_session_value("HERMES_SESSION_PLATFORM") == "slack":
+                from gateway.slack_turn_notice import notice
+                return notice("history")
         if body is None and reason == "session_persistence_failed":
             from hermes_constants import display_hermes_home, profile_cli_selector
             from hermes_state_errors import STORAGE_RECOVERY_DOCS_URL

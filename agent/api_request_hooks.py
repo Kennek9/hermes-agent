@@ -43,7 +43,28 @@ class ApiRequestHooksMixin:
 
         cu = normalize_usage(raw_usage, provider=self.provider, api_mode=self.api_mode)
         summary = asdict(cu)
-        summary.pop("raw_usage", None)
+        raw = summary.pop("raw_usage", None) or {}
+        # Preserve the distinction between a provider-reported zero and an absent counter.
+        summary["observed_cache_read_tokens"] = None
+        for field, paths in {
+            "cache_read_tokens": (("input_tokens_details", "cached_tokens"),
+                                  ("prompt_tokens_details", "cached_tokens"), ("cache_read_input_tokens",),
+                                  ("prompt_cache_hit_tokens",), ("cached_tokens",)),
+            "reasoning_tokens": (("output_tokens_details","reasoning_tokens"),
+                                 ("completion_tokens_details","reasoning_tokens"), ("reasoning_tokens",)),
+            "cache_write_tokens": (("input_tokens_details","cache_write_tokens"),
+                                   ("input_tokens_details","cache_creation_tokens"),
+                                   ("prompt_tokens_details","cache_write_tokens"),
+                                   ("prompt_tokens_details","cache_creation_input_tokens"),
+                                   ("cache_creation_input_tokens",), ("cache_write_tokens",)),
+        }.items():
+            for path in paths:
+                value = raw
+                for part in path:
+                    value = value.get(part) if isinstance(value, dict) else None
+                if type(value) is int and value >= 0:
+                    summary["observed_" + field] = value
+                    break
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary

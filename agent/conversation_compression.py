@@ -1982,7 +1982,8 @@ def _emit_feasibility_notice(agent: Any, msg: str) -> None:
         return
     agent._last_feasibility_notice = msg
     agent._compression_warning = msg
-    agent._emit_diagnostic_status(msg)
+    if getattr(agent, "platform", None) != "slack":
+        agent._emit_diagnostic_status(msg)
 
 
 def _lower_threshold_to_aux_context(
@@ -2204,7 +2205,7 @@ def replay_compression_warning(agent: Any) -> None:
     Called once at the start of the first ``run_conversation()``, when the gateway callback (absent during
     ``__init__``) is finally wired."""
     msg = getattr(agent, "_compression_warning", None)
-    if msg and agent.status_callback:
+    if msg and agent.status_callback and getattr(agent, "platform", None) != "slack":
         # Replayed as a classified diagnostic so every sink applies its own policy snapshot.
         from gateway.warning_notifications import DiagnosticText
         with contextlib.suppress(Exception):
@@ -3480,7 +3481,7 @@ def _finish_compaction_boundary(
     # _compression_warning so a late-bound status_callback can replay it.
     compressor = agent.context_compressor
     _cc = compressor.compression_count
-    if _cc >= 2:
+    if _cc >= 2 and getattr(agent, "platform", None) != "slack":
         _cc_msg = (
             f"{agent.log_prefix}⚠️  Session compressed {_cc} times — accuracy may degrade. Consider /new to start fresh."
         )
@@ -3544,7 +3545,7 @@ def _candidate_rejected(
     if getattr(agent.context_compressor, "_last_compress_aborted", False):
         _summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         _err = _summary_error or "unknown error"
-        if getattr(agent, "_last_compression_summary_warning", None) != _err:
+        if getattr(agent, "platform", None) != "slack" and getattr(agent, "_last_compression_summary_warning", None) != _err:
             agent._last_compression_summary_warning = _err
             agent._emit_warning(
                 f"⚠ Compression aborted: {_err}. "

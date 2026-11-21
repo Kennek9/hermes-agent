@@ -1543,7 +1543,9 @@ def _run_conversation_turn(
         s.api_call_count = int(codex_result.get("api_calls") or 0)
         s.active_system_prompt = _sync_failover_system_message(agent, None, s.active_system_prompt)
 
-    while (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    qa_limit = getattr(agent, "_turn_qa_limit", None)
+    while ((s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+           or agent._budget_grace_call) and (qa_limit is None or s.api_call_count < qa_limit):
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)

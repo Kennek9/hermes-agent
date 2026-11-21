@@ -127,6 +127,7 @@ def _resolve_budget_fallback(
     preserved_verification_fallback)``."""
     budget_exhausted = (
         api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+        or (type(getattr(agent, "_turn_qa_limit", None)) is int and api_call_count >= agent._turn_qa_limit)
     )
     preserved_verification_fallback = False
     if (
@@ -143,6 +144,10 @@ def _resolve_budget_fallback(
             if _pending_verification_response_previewed:
                 agent._response_was_previewed = True
             preserved_verification_fallback = True
+        elif getattr(agent, "_turn_qa_limit", None) is not None:
+            # A summary request would exceed the host's per-turn cap.
+            final_response = ("本轮未取得足够证据。" if agent._turn_qa_locale == "zh-CN"
+                              else "I couldn't verify an answer from the available evidence.")
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_diagnostic_status(

@@ -169,6 +169,25 @@ _HANDOFF_FAIL_SQL = "UPDATE sessions SET handoff_state = 'failed', handoff_error
 class SessionGatewayMixin:
     """Routing index, session peers/orphans, hygiene streaks, heartbeats, handoffs."""
 
+    def slack_thread_participation(self, workspace, channel, thread, user, *, refresh=False):
+        """A routing hint for a previously addressed bot, never an access grant."""
+        key = (workspace, channel, thread, user)
+        if not all(key):
+            return False
+        cutoff = int(time.time()) - 7 * 86400
+        if refresh:
+            def write(conn):
+                conn.execute("DELETE FROM slack_mentioned_threads WHERE last_active_at < ?", (cutoff,))
+                conn.execute("""INSERT INTO slack_mentioned_threads VALUES (?,?,?,?,?)
+                    ON CONFLICT(workspace_id,channel_id,thread_ts,user_id)
+                    DO UPDATE SET last_active_at=excluded.last_active_at""", (*key, int(time.time())))
+            self._execute_write(write)
+            return True
+        with self._read_ctx() as conn:
+            return conn.execute("""SELECT 1 FROM slack_mentioned_threads
+                WHERE workspace_id=? AND channel_id=? AND thread_ts=? AND user_id=?
+                  AND last_active_at>=?""", (*key, cutoff)).fetchone() is not None
+
     def _reap_inactive_orphan_desktop_holders(
         self, holders: List[Tuple[int, str]], *, min_age_seconds: float) -> List[int]:
         """Terminate old PPID-1 Desktop ephemeral backends with no client.

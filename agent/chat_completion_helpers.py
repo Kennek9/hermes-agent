@@ -1269,6 +1269,9 @@ def _reasoning_config_for_wire(agent):
     applies its own default.
     """
     cfg = agent.reasoning_config
+    if getattr(agent, "_turn_qa_effort", None) in ("low", "high"):
+        cfg = {"enabled": True, "effort": agent._turn_qa_effort}
+
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:

@@ -120,6 +120,10 @@ def build_api_request(
         api_kwargs = agent._build_api_kwargs(api_messages)
     else:
         api_kwargs = agent._build_api_kwargs(api_messages, tools_for_api=tools_for_api)
+    qa_limit = getattr(agent, "_turn_qa_limit", None)
+    if type(qa_limit) is int and api_call_count >= qa_limit and api_kwargs.get("tools"):
+        # Preserve the provider's static tool-schema prefix on the synthesis round.
+        api_kwargs["tool_choice"] = "none"
     # Messages were scrubbed above; this walk covers the rest of the payload (tool descriptions,
     # extra_body, kwargs strings) — see sanitize_outbound_kwargs for the #50959 rationale.
     sanitize_outbound_kwargs(agent, api_kwargs)

@@ -117,6 +117,8 @@ class StatusOutputMixin:
         # cooldown + anti-thrash (ineffective) are both "compression blocked".
         if _warn_kind in ("cooldown", "ineffective"):
             self._touch_activity(f"compression blocked ({reason})", provenance=ActivityProvenance.AGENT_COMPRESSION_COOLDOWN)
+        if getattr(self, "platform", None) == "slack":
+            return
         self._emit_warning(CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
             tokens=preflight_tokens, threshold=threshold_tokens, reason=reason,
         ))
@@ -131,6 +133,8 @@ class StatusOutputMixin:
         _warn_key = ("uncompressed_ctx_overflow", context_length)
         if getattr(self, "_last_ctx_overflow_warn", None) != _warn_key:
             self._last_ctx_overflow_warn = _warn_key
+            if getattr(self, "platform", None) == "slack":
+                return
             self._emit_warning(
                 f"⚠️ Session context (~{preflight_tokens:,} tokens) exceeds the model "
                 f"context window (~{context_length:,} tokens) with compression disabled "
