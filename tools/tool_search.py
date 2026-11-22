@@ -147,11 +147,18 @@ _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "setup"})
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
+def _slack_eager_knowledge_tool(name: str) -> bool:
+    if name not in {"tada_knowledge_search", "tada_read"} or _registry_toolset(name) != "company_knowledge":
+        return False
+    from gateway.session_context import get_trusted_session_value
+    return get_trusted_session_value("HERMES_SESSION_PLATFORM") == "slack"
+
+
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
-    if name in BRIDGE_TOOL_NAMES:
+    if name in BRIDGE_TOOL_NAMES or _slack_eager_knowledge_tool(name):
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -531,13 +538,18 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
     return json.dumps(result, ensure_ascii=False)
 
 
+def _can_call_through_bridge(name: str, defer_tools: frozenset) -> bool:
+    # Keep old Slack replies using tool_call compatible after eager promotion.
+    return is_deferrable_tool_name(name, defer_tools) or _slack_eager_knowledge_tool(name)
+
+
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
-    """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope — the
+    """Bridge-callable names in the *pre-assembly* tool definitions — the
     universe ``tool_call`` may reach. Gates bridge dispatch AND the executor unwrap so a
     restricted session cannot invoke an out-of-scope tool via the bridge."""
     defer_tools = load_config_readonly().effective_defer_tools
     return frozenset(n for n in _tool_def_names(tool_defs)
-                     if n and is_deferrable_tool_name(n, defer_tools))
+                     if n and _can_call_through_bridge(n, defer_tools))
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
@@ -567,7 +579,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
 
     name = entries[0]["name"]
     raw_args = entries[0]["arguments"]
-    if not is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools):
+    if not _can_call_through_bridge(name, load_config_readonly().effective_defer_tools):
         return None, {}, not_deferrable_error(name)
     return name, raw_args, None
 

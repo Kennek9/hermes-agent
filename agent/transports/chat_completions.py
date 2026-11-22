@@ -73,6 +73,7 @@ def _add_prompt_cache_key(
     api_kwargs: dict[str, Any], *, messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None, supports_prompt_cache_key: bool,
     session_id: str | None = None, cache_scope_id: str | None = None,
+    official_openai: bool = False, static_cache_prefix: str | None = None,
 ) -> None:
     """Add a content-addressed ``prompt_cache_key`` only for a capable endpoint.
 
@@ -94,7 +95,7 @@ def _add_prompt_cache_key(
     # key in extra_body (not top-level) and GitHub/Copilot Responses opts out of cache-key routing entirely
     # — for those hosts, skip it here.
     from agent.transports.codex import (
-        _bound_prompt_cache_key_field, _cache_scope_from_session_id, _content_cache_key
+        _bound_prompt_cache_key_field, _cache_scope_from_session_id, _content_cache_key, _slack_cache_prefix,
     )
 
     containers = [c for c in (api_kwargs, api_kwargs.get("extra_body")) if isinstance(c, dict) and "prompt_cache_key" in c]
@@ -104,9 +105,11 @@ def _add_prompt_cache_key(
         return
     if not supports_prompt_cache_key:
         return
-    cache_key = _content_cache_key(
-        _static_prompt_instructions(messages), tools, _cache_scope_from_session_id(cache_scope_id or session_id),
-    )
+    instructions = _static_prompt_instructions(messages)
+    scope = _cache_scope_from_session_id(cache_scope_id or session_id)
+    if official_openai:
+        instructions, scope = _slack_cache_prefix(instructions, static_cache_prefix, scope)
+    cache_key = _content_cache_key(instructions, tools, scope)
     if cache_key:
         api_kwargs["prompt_cache_key"] = cache_key
 
@@ -369,6 +372,8 @@ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *,
     _add_prompt_cache_key(
         api_kwargs, messages=sanitized, tools=api_kwargs.get("tools"), supports_prompt_cache_key=supports_prompt_cache_key,
         session_id=params.get("session_id"), cache_scope_id=params.get("cache_scope_id"),
+        official_openai=_is_openai_api_base_url(params.get("base_url")),
+        static_cache_prefix=params.get("static_cache_prefix"),
     )
     return api_kwargs
 
@@ -597,7 +602,9 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
         return _finish_kwargs(
-            api_kwargs, sanitized, params, supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            api_kwargs, sanitized, params,
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
+            or _is_openai_api_base_url(params.get("base_url")),
         )
 
     @decode_tool_names

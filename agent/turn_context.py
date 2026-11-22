@@ -607,6 +607,7 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
 
     agent._turn_qa_limit = None
     agent._turn_qa_effort = None
+    agent._turn_qa_model = None
     agent._turn_qa_locale = None
     agent.iteration_budget = IterationBudget(agent.max_iterations)
     # Wall-clock run budget: stamped only when configured (one wrap-up notice per run).
@@ -790,6 +791,8 @@ def _collect_pre_llm_call_context(
                     agent._turn_qa_limit = cap
                     agent._turn_qa_locale = r.get("reply_locale")
                     agent._turn_qa_effort = "low" if policy == "fast_qa" else "high"
+                    model = r.get("qa_model") if policy == "fast_qa" else None
+                    agent._turn_qa_model = model if isinstance(model, str) and model else None
                     agent.iteration_budget = IterationBudget(cap)
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])

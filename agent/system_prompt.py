@@ -761,7 +761,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Context tier (project/worktree-dependent, may change between sessions) ──
     context_parts: List[str] = []
     # ephemeral_system_prompt is injected at API-call time only, never cached.
-    if system_message is not None:
+    from utils import base_url_host_matches
+    slack_openai = getattr(agent, "platform", None) == "slack" and base_url_host_matches(
+        getattr(agent, "base_url", ""), "api.openai.com",
+    )
+    if system_message is not None and not slack_openai:
         context_parts.append(system_message)
     context_parts.extend(_context_files_part(agent, _ctx_len, _soul_loaded))
     if coding_workspace_parts:
@@ -778,6 +782,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     volatile_parts.append(_timestamp_line(agent))
+    if slack_openai and system_message is not None:
+        # The caller can attach thread-specific instructions. Preserve their
+        # system role after the reusable Slack prompt and plugin sections.
+        volatile_parts.append(system_message)
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
     if environment_hints:
