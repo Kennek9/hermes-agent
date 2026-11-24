@@ -9,6 +9,41 @@ from plugins.platforms.slack.adapter import SlackAdapter
 from plugins.platforms.slack.message_sources import message_files, nested_message_blocks
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorized", [True, False])
+async def test_thread_broadcast_captures_authorized_document_share_without_reply(authorized):
+    adapter = SlackAdapter(PlatformConfig(enabled=True))
+    adapter._team_bot_user_ids["T_SOURCE"] = "U_BOT"
+    adapter._bot_user_id = "U_BOT"
+    adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+    adapter.set_authorization_check(lambda *_: authorized)
+    adapter._channel_gate_allows = AsyncMock(return_value=False)
+    adapter.handle_message = AsyncMock()
+    handler = AsyncMock()
+    adapter._platform_event_handler = handler
+    message = {
+        "type": "message",
+        "subtype": "thread_broadcast",
+        "team": "T_SOURCE",
+        "channel": "C_SOURCE",
+        "channel_type": "group",
+        "user": "U_AUTHOR",
+        "ts": "1794981294.689009",
+        "thread_ts": "1794812060.735629",
+        "client_msg_id": "synthetic-message",
+        "text": "Plan https://docs.google.com/document/d/synthetic/edit",
+    }
+    await adapter._handle_slack_message(message, {"team_id": "T_SOURCE"})
+    assert handler.await_count == int(authorized)
+    if authorized:
+        event = handler.await_args.args[0]
+        assert event["event_type"] == "message_received"
+        assert event["payload"]["user_id"] == "U_AUTHOR"
+        assert event["payload"]["thread_root_ts"] == message["thread_ts"]
+        assert message["text"] in event["payload"]["content"]
+    adapter.handle_message.assert_not_awaited()
+
+
 @pytest.mark.parametrize("flag", ["is_msg_unfurl", "is_share"])
 @pytest.mark.parametrize("author", ["U_ORIGINAL", None, "", "U_BOT"])
 def test_live_and_thread_projection_keep_other_and_unknown_authors(flag, author):

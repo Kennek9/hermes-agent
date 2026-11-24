@@ -429,6 +429,15 @@ def _slack_prefix_scope(fallback: str) -> str:
     return f"slack:{get_hermes_home()}:{team}:{bucket}"
 
 
+def _slack_cache_prefix(instructions: str, static_prefix: Any, scope: str) -> tuple[str, str]:
+    """Use only a verified leading prefix when trusted Slack context shares the cache."""
+    slack_scope = _slack_prefix_scope(scope)
+    if slack_scope != scope and isinstance(static_prefix, str) and static_prefix:
+        if instructions.startswith(static_prefix):
+            return static_prefix, slack_scope
+    return instructions, slack_scope
+
+
 def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]], scope_id: str = "") -> Optional[str]:
     """``pck_<sha256[:24]>`` of (scope_id, instructions, name-sorted tools), or None if nothing static.
 
@@ -749,7 +758,10 @@ class ResponsesApiTransport(ProviderTransport):
         # Content-addressed (instructions + tools) within a logical scope that survives
         # compression rotation; session_id itself stays untouched for transcript isolation.
         _cache_scope = _cache_scope_from_session_id(params.get("cache_scope_id") or session_id)
-        cache_key = _content_cache_key(instructions, response_tools, _slack_prefix_scope(_cache_scope)) or _cache_scope
+        cache_prefix, cache_scope = _slack_cache_prefix(
+            instructions, params.get("static_cache_prefix"), _cache_scope,
+        )
+        cache_key = _content_cache_key(cache_prefix, response_tools, cache_scope) or _cache_scope
         # xAI takes prompt_cache_key in extra_body (below); GitHub Models opts out entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
             kwargs["prompt_cache_key"] = cache_key
@@ -771,6 +783,28 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
             kwargs["model"] = wire_model
+
+        static_prefix = params.get("static_cache_prefix")
+        if (
+            cache_scope != _cache_scope
+            and static_prefix
+            and cache_prefix == static_prefix
+            and _is_openai_api_origin(params.get("base_url"))
+            and str(wire_model).startswith(("gpt-5.6", "gpt-6"))
+            and not request_overrides.keys() & {"input", "instructions", "previous_response_id"}
+        ):
+            # Modern Responses models implicitly write through the current user
+            # message. An explicit boundary also saves this prefix across threads.
+            static = {"role": "developer", "content": [{
+                "type": "input_text", "text": static_prefix,
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }]}
+            tail = instructions[len(static_prefix):].strip()
+            leading = [static]
+            if tail:
+                leading.append({"role": "developer", "content": tail})
+            kwargs["input"] = leading + kwargs["input"]
+            del kwargs["instructions"]
 
         _sanitize_astra_request_kwargs(kwargs, model, params.get("base_url"))
 
@@ -896,6 +930,7 @@ class ResponsesApiTransport(ProviderTransport):
         normalized = _preflight_codex_api_kwargs(
             api_kwargs, allow_stream=allow_stream, is_github_responses=is_github_responses,
             sanitize_harmony_tokens=sanitize_harmony_tokens,
+            allow_developer=_is_openai_api_origin(str(self._last_issuer_kind or "").removeprefix("other:")),
         )
         _bound_prompt_cache_key_field(normalized)
         _bound_prompt_cache_key_field(normalized.get("extra_body"))

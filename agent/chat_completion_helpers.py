@@ -1371,14 +1371,25 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
         guardrail_config=getattr(agent, "_bedrock_guardrail_config", None))
 
 
+def _openai_turn_profile(agent):
+    """Select a turn-local Slack model and the native stable system prefix."""
+    if not base_url_host_matches(agent.base_url, "api.openai.com"):
+        return agent.model, None
+    return (
+        getattr(agent, "_turn_qa_model", None) or agent.model,
+        getattr(agent, "_cached_system_prompt_static", None),
+    )
+
+
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     from agent.codex_responses_adapter import classify_responses_route
     from agent.native_compaction import native_compaction_context_management
     is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
     # Native server-side compaction (gpt-5.6 on direct OpenAI / ChatGPT Codex routes
     # only) — None on every other route/model, leaving the request unchanged.
+    model, static_cache_prefix = _openai_turn_profile(agent)
     context_management = native_compaction_context_management(agent, is_codex_backend=is_codex_backend,
-        is_xai_responses=is_xai_responses, is_github_responses=is_github_responses)
+        is_xai_responses=is_xai_responses, is_github_responses=is_github_responses) if model == agent.model else None
     # xAI's /responses endpoint 400s on ``pattern``/``format`` schema keywords and on
     # ``enum`` values containing ``/`` — strip them (#27197). Deep-copy first: the
     # sanitizers mutate in place and tools_for_api aliases agent.tools (#27907).
@@ -1392,10 +1403,10 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         except Exception as exc:
             logger.warning("%s⚠️ Failed to sanitize tool schemas for xAI: %s", getattr(agent, "log_prefix", ""), exc)
     ephemeral_out = _consume_ephemeral_max_output(agent)
-    return agent._get_transport().build_kwargs(model=agent.model,
+    return agent._get_transport().build_kwargs(model=model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        cache_scope_id=cache_scope_id, base_url=agent.base_url, static_cache_prefix=static_cache_prefix,
         max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
@@ -1408,6 +1419,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
 
 def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     transport = agent._get_transport()
+    model, static_cache_prefix = _openai_turn_profile(agent)
     tools_for_api = _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api)
 
     _is_qwen = agent._is_qwen_portal()
@@ -1421,7 +1433,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _omit_temp, _fixed_temp = False, None
     with contextlib.suppress(Exception):
         from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
-        _ft = _fixed_temperature_for_model(agent.model, agent.base_url)
+        _ft = _fixed_temperature_for_model(model, agent.base_url)
         _omit_temp = _ft is OMIT_TEMPERATURE
         _fixed_temp = None if _omit_temp else _ft
 
@@ -1436,12 +1448,12 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _ephemeral_out = _consume_ephemeral_max_output(agent)
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
-    _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
+    _common = dict(model=model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
         tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
         max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
+        cache_scope_id=cache_scope_id, static_cache_prefix=static_cache_prefix, ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None, openrouter_min_coding_score=agent.openrouter_min_coding_score,
         supports_reasoning=agent._supports_reasoning_extra_body(),
         qwen_session_metadata=_qwen_meta)
@@ -1452,7 +1464,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     # Legacy flag path: only for a provider absent from the providers/ registry.
     return transport.build_kwargs(
         **_common,
-        model_lower=(agent.model or "").lower(),
+        model_lower=(model or "").lower(),
         is_openrouter=_is_or,
         is_nous=base_url_host_matches(_host, "nousresearch.com"),
         is_qwen_portal=_is_qwen,

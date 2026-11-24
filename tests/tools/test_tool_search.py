@@ -886,3 +886,26 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+def test_slack_eager_knowledge_tools_keep_write_tools_deferred(monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import tool_search
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "check_fn_cache_scope", lambda: "fixture-profile")
+    monkeypatch.setattr(tool_search, "_registry_toolset", lambda _: "company_knowledge")
+    incoming = [_td(name) for name in ("tada_knowledge_search", "tada_read", "tada_feedback")]
+    config = tool_search.ToolSearchConfig.from_raw({"enabled": "on"})
+    cache_keys = []
+    for platform, direct in (("slack", {"tada_knowledge_search", "tada_read"}), ("feishu", set())):
+        tokens = set_session_vars(platform=platform)
+        try:
+            assembled = tool_search.assemble_tool_defs(incoming, config=config)
+            cache_keys.append(model_tools._tool_defs_cache_key(["company_knowledge"], None, False))
+        finally:
+            clear_session_vars(tokens)
+        visible = {definition["function"]["name"] for definition in assembled.tool_defs}
+        assert visible & {"tada_knowledge_search", "tada_read", "tada_feedback"} == direct
+        assert assembled.activated
+    assert None not in cache_keys and cache_keys[0] != cache_keys[1]

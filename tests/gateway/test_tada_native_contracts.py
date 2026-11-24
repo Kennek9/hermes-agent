@@ -461,3 +461,78 @@ async def test_sdk_maintenance_reaches_only_revocation_when_chat_actor_is_unauth
     )
     assert len(calls) == 2
     chat_dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("wire", ["responses", "chat"])
+def test_slack_first_turn_cache_is_shared_only_within_the_same_scope(wire, isolated_home):
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from agent.transports.codex import ResponsesApiTransport
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    transport = ResponsesApiTransport() if wire == "responses" else ChatCompletionsTransport()
+    stable = "Use authorized company evidence for answers."
+
+    def request(thread, workspace, home):
+        home_token = set_hermes_home_override(home)
+        identity = set_session_vars(
+            platform="slack", scope_id=workspace, user_id="U_FIXTURE", thread_id=thread,
+        )
+        try:
+            payload = transport.build_kwargs(
+                model="gpt-6.1-terra", base_url="https://api.openai.com/v1",
+                session_id=thread, static_cache_prefix=stable,
+                messages=[{"role": "system", "content": stable + "\n\nThread: " + thread},
+                          {"role": "user", "content": "Question " + thread}],
+            )
+            return transport.preflight_kwargs(payload) if wire == "responses" else payload
+        finally:
+            clear_session_vars(identity)
+            reset_hermes_home_override(home_token)
+
+    first = request("one", "T_FIXTURE_A", isolated_home)
+    other_workspace = request("two", "T_FIXTURE_B", isolated_home)
+    other_profile = request("two", "T_FIXTURE_A", isolated_home.parent / "other")
+    second = request("two", "T_FIXTURE_A", isolated_home)
+    assert first["prompt_cache_key"] == second["prompt_cache_key"]
+    assert first["prompt_cache_key"] != other_workspace["prompt_cache_key"]
+    assert first["prompt_cache_key"] != other_profile["prompt_cache_key"]
+    if wire == "responses":
+        assert "instructions" not in first
+        assert first["input"][0] == second["input"][0] == {
+            "role": "developer", "content": [{
+                "type": "input_text", "text": stable,
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            }],
+        }
+        assert first["input"][1]["content"] == "Thread: one"
+        assert second["input"][1]["content"] == "Thread: two"
+    else:
+        assert first["messages"][0]["content"].endswith("Thread: one")
+        assert second["messages"][0]["content"].endswith("Thread: two")
+
+
+def test_slack_fast_model_override_is_local_to_the_qa_turn(monkeypatch):
+    from agent.chat_completion_helpers import _openai_turn_profile
+    from agent.turn_context import _collect_pre_llm_call_context
+    from hermes_cli import lifecycle
+
+    agent = SimpleNamespace(
+        session_id="TEST_SESSION", model="gpt-6.1-terra", platform="slack",
+        max_iterations=16, base_url="https://api.openai.com/v1",
+    )
+
+    def apply(mode):
+        monkeypatch.setattr(lifecycle, "invoke_hook", lambda *a, **kw: [
+            {"qa_mode": mode, "qa_model": "gpt-5.4-mini"},
+        ])
+        _collect_pre_llm_call_context(
+            agent, effective_task_id="task", turn_id="turn", original_user_message="Question",
+            messages=[], conversation_history=None,
+        )
+        return _openai_turn_profile(agent)[0]
+
+    assert apply("fast_qa") == "gpt-5.4-mini"
+    assert agent._turn_qa_effort == "low"
+    assert apply("deep_qa") == "gpt-6.1-terra"
+    assert agent._turn_qa_effort == "high"
+    assert agent.model == "gpt-6.1-terra"

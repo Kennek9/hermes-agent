@@ -749,6 +749,7 @@ def estimate_native_responses_preflight_tokens(
 
 _PreflightCtx = NamedTuple("_PreflightCtx", [
     ("sanitize_text", Callable[[str], str]), ("sanitize_harmony_tokens", bool), ("is_github_responses", bool), ("seen_ids", set),
+    ("allow_developer", bool),
 ])
 
 
@@ -826,9 +827,10 @@ def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Di
 
 
 def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
-    """Untyped ``user``/``assistant`` role message — the only legal shape besides typed items."""
+    """Normalize role messages and preserve authorized explicit cache boundaries."""
     role = item.get("role")
-    if role not in {"user", "assistant"}:
+    developer = role == "developer" and ctx.allow_developer
+    if role not in {"user", "assistant"} and not developer:
         raise ValueError(
             f"Codex Responses input[{idx}] has unsupported item shape (type={item.get('type')!r}, role={role!r})."
         )
@@ -848,7 +850,10 @@ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) 
         elif (ptype := _part_type(part)) in _TEXT_PART_TYPES:
             text = part.get("text", "")
             text = text if isinstance(text, str) else str(text or "")
-            validated.append({"type": text_type, "text": ctx.sanitize_text(text)})
+            normalized_part = {"type": text_type, "text": ctx.sanitize_text(text)}
+            if developer and part.get("prompt_cache_breakpoint") == {"mode": "explicit"}:
+                normalized_part["prompt_cache_breakpoint"] = part["prompt_cache_breakpoint"]
+            validated.append(normalized_part)
         elif ptype in _IMAGE_PART_TYPES:
             validated.append(_input_image_part(part, role, keep_empty_url=True))
         else:
@@ -866,11 +871,12 @@ _PREFLIGHT_ITEM_HANDLERS: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {
 
 def _preflight_codex_input_items(
     raw_items: Any, *, is_github_responses: bool = False, sanitize_harmony_tokens: bool = False,
+    allow_developer: bool = False,
 ) -> List[Dict[str, Any]]:
     if not isinstance(raw_items, list):
         raise ValueError("Codex Responses input must be a list of input items.")
     sanitize_text = _neutralize_harmony_tokens if sanitize_harmony_tokens else (lambda text: text)
-    ctx = _PreflightCtx(sanitize_text, sanitize_harmony_tokens, is_github_responses, set())
+    ctx = _PreflightCtx(sanitize_text, sanitize_harmony_tokens, is_github_responses, set(), allow_developer)
     normalized: List[Dict[str, Any]] = []
     for idx, item in enumerate(raw_items):
         if not isinstance(item, dict):
@@ -936,11 +942,12 @@ def _optional_dict(api_kwargs: Dict[str, Any], key: str) -> Optional[Dict[str, A
 
 def _preflight_codex_api_kwargs(
     api_kwargs: Any, *, allow_stream: bool = False, is_github_responses: bool = False,
-    sanitize_harmony_tokens: bool = False,
+    sanitize_harmony_tokens: bool = False, allow_developer: bool = False,
 ) -> Dict[str, Any]:
     if not isinstance(api_kwargs, dict):
         raise ValueError("Codex Responses request must be a dict.")
-    if missing := sorted(key for key in ("model", "instructions", "input") if key not in api_kwargs):
+    required = ("model", "input") if allow_developer else ("model", "instructions", "input")
+    if missing := sorted(key for key in required if key not in api_kwargs):
         raise ValueError(f"Codex Responses request missing required field(s): {', '.join(missing)}.")
     model = api_kwargs.get("model")
     if not _nonblank(model):
@@ -949,11 +956,14 @@ def _preflight_codex_api_kwargs(
     if sanitize_harmony_tokens:
         instructions = _neutralize_harmony_tokens(instructions)
     input_items = _preflight_codex_input_items(
-        api_kwargs.get("input"), is_github_responses=is_github_responses, sanitize_harmony_tokens=sanitize_harmony_tokens,
+        api_kwargs.get("input"), is_github_responses=is_github_responses,
+        sanitize_harmony_tokens=sanitize_harmony_tokens, allow_developer=allow_developer,
     )
-    normalized: Dict[str, Any] = {
-        "model": model.strip(), "instructions": instructions, "input": input_items, "store": False,
-    }
+    normalized: Dict[str, Any] = {"model": model.strip(), "input": input_items, "store": False}
+    if "instructions" in api_kwargs:
+        normalized["instructions"] = instructions
+    elif not input_items or input_items[0].get("role") != "developer":
+        raise ValueError("Codex Responses request missing required field(s): instructions.")
     tools = api_kwargs.get("tools")
     if tools is not None:
         if not isinstance(tools, list):
