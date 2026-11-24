@@ -4514,7 +4514,11 @@ class SlackAdapter(BasePlatformAdapter):
     async def _emit_message_created_event(self, event: dict, payload: Optional[dict] = None) -> None:
         """Observe authorized human messages independently of whether they wake a chat."""
         handler = getattr(self, "_platform_event_handler", None)
-        if handler is None or event.get("subtype") not in {None, "", "file_share"} or event.get("_slack_changed_event_ts"):
+        if (
+            handler is None
+            or event.get("subtype") not in {None, "", "file_share", "thread_broadcast"}
+            or event.get("_slack_changed_event_ts")
+        ):
             return
         if self._event_declares_bot_sender(event):
             return
@@ -4840,8 +4844,11 @@ class SlackAdapter(BasePlatformAdapter):
         force_process = bool(event.get("_hermes_force_process"))
         if await self._peer_bot_drop(event, user_id, bot_uid, channel_id, team_id, is_mentioned):
             return
-        if (event.get("subtype") in {None, "", "file_share"} and user_id and user_id != bot_uid
-                and not await self._resolve_user_is_bot(user_id, chat_id=channel_id, team_id=team_id)):
+        if (
+            event.get("subtype") in {None, "", "file_share", "thread_broadcast"}
+            and user_id and user_id != bot_uid
+            and not await self._resolve_user_is_bot(user_id, chat_id=channel_id, team_id=team_id)
+        ):
             await self._emit_message_created_event(event, payload)
         if (
             not is_one_to_one_dm and bot_uid and not await self._channel_gate_allows(
